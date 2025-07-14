@@ -74,7 +74,7 @@ func (h *OAuthHandler) RegisterRoutes(app *fiber.App) {
 	oauth.Get("/authorize", h.AuthorizeEndpoint)
 	oauth.Get("/callback", h.CallbackEndpoint)
 	oauth.Post("/token", h.TokenEndpoint)
-	oauth.Post("/revoke", h.RevokeTokenEndpoint)
+	oauth.Post("/revoke", h.RevokeEndpoint)
 }
 
 // RegisterClient handles dynamic client registration
@@ -430,8 +430,48 @@ func (h *OAuthHandler) TokenEndpoint(c *fiber.Ctx) error {
 	}
 }
 
-func (h *OAuthHandler) RevokeTokenEndpoint(c *fiber.Ctx) error {
-	return nil
+// RevokeEndpoint handles token revocation (RFC 7009)
+func (h *OAuthHandler) RevokeEndpoint(c *fiber.Ctx) error {
+	token := c.FormValue("token")
+	tokenTypeHint := c.FormValue("token_type_hint")
+	clientID := c.FormValue("client_id")
+	clientSecret := c.FormValue("client_secret")
+
+	h.logger.Info().
+		Str("token_type_hint", tokenTypeHint).
+		Str("client_id", clientID).
+		Bool("has_token", token != "").
+		Bool("has_client_secret", clientSecret != "").
+		Str("client_ip", c.IP()).
+		Str("user_agent", c.Get("User-Agent")).
+		Msg("Token revocation requested")
+
+	if token == "" {
+		return c.Status(fiber.StatusBadRequest).JSON(models.NewOAuth2Error(models.ErrorInvalidRequest, "Missing token parameter"))
+	}
+
+	// Validate client if credentials provided
+	if clientID != "" {
+		client, err := h.clientRegistry.ValidateClient(clientID, clientSecret)
+		if err != nil {
+			h.logger.LogSecurityEvent("invalid_client_revocation", c.IP(), c.Get("User-Agent"), "medium", map[string]interface{}{
+				"client_id": clientID,
+				"error":     err.Error(),
+			})
+			return c.Status(fiber.StatusUnauthorized).JSON(models.NewOAuth2Error(models.ErrorInvalidClient, "Invalid client credentials"))
+		}
+
+		h.logger.Debug().
+			Str("client_id", client.ClientID).
+			Str("client_name", client.ClientName).
+			Msg("Client validated for token revocation")
+	}
+
+	// TODO: implement actual token revocation logic
+
+	// RFC 7009: The authorization server responds with HTTP status code 200 if the token
+	// has been revoked successfully or if the client submitted an invalid token.
+	return c.SendStatus(fiber.StatusOK)
 }
 
 // Helper methods

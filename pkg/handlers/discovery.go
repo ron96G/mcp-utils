@@ -249,7 +249,7 @@ func (h *DiscoveryHandler) AuthMiddleware() fiber.Handler {
 		if err != nil {
 			h.logger.Warn().
 				Err(err).
-				Str("token", token).
+				Interface("claims", claims).
 				Msg("Failed to parse access token")
 			// Return 401 with WWW-Authenticate header
 			return h.Handle401Response(c, "", "invalid_token", "Invalid access token")
@@ -257,6 +257,7 @@ func (h *DiscoveryHandler) AuthMiddleware() fiber.Handler {
 
 		// Store token in context for use by handlers
 		c.Locals("access_token", token)
+		c.Locals("access_token_claims", claims)
 
 		ctx := context.WithValue(c.Context(), SubjectKey, claims.Subject)
 		ctx = context.WithValue(ctx, NameKey, claims.Name)
@@ -297,7 +298,7 @@ func parseAccessToken(tokenString, expectedAud string) (*AccessTokenClaims, erro
 
 	// Basic validation
 	if expectedAud != "" && claims.Aud != expectedAud {
-		return nil, fmt.Errorf("invalid audience")
+		return &claims, fmt.Errorf("invalid audience")
 	}
 
 	return &claims, nil
