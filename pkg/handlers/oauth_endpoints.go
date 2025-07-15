@@ -2,6 +2,8 @@ package handlers
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -10,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/pkg/errors"
 	"github.com/ron96g/mcp-utils/pkg/auth"
 	"github.com/ron96g/mcp-utils/pkg/config"
 	"github.com/ron96g/mcp-utils/pkg/log"
@@ -39,6 +42,7 @@ type SessionStore interface {
 	Set(key string, value interface{}, ttl time.Duration) error
 	Get(key string) (interface{}, error)
 	Delete(key string) error
+	CompareAndSet(key string, expected, new interface{}, ttl time.Duration) (bool, error)
 }
 
 // NewOAuthHandler creates a new OAuth2 handler
@@ -276,7 +280,13 @@ func (h *OAuthHandler) AuthorizeEndpoint(w http.ResponseWriter, r *http.Request)
 	}
 
 	// Store authorization session for callback
-	sessionKey := h.generateSessionKey()
+	sessionKey, err := h.generateSessionKey()
+	if err != nil {
+		h.logger.Error().
+			Str("client_id", req.ClientID).
+			Err(err)
+		h.redirectError(w, r, req.RedirectURI, req.State, models.ErrorInvalidRequest, "Failed to create session")
+	}
 	sessionData := &AuthorizationSession{
 		Request:   req,
 		Client:    client,
@@ -576,8 +586,13 @@ func (h *OAuthHandler) validateAndStorePKCE(req *models.AuthorizationRequest, cl
 }
 
 // generateSessionKey generates a unique session key
-func (h *OAuthHandler) generateSessionKey() string {
-	return fmt.Sprintf("auth_session_%d_%s", time.Now().UnixNano(), generateRandomString(16))
+func (h *OAuthHandler) generateSessionKey() (string, error) {
+	b := make([]byte, 32)
+	_, err := rand.Read(b)
+	if err != nil {
+		return "", errors.Wrapf(err, "failed to generate random session key")
+	}
+	return base64.URLEncoding.EncodeToString(b), nil
 }
 
 // getAuthorizationSession retrieves an authorization session
@@ -638,7 +653,7 @@ type AuthorizationCodeData struct {
 // handleAuthorizationCodeGrant handles authorization code grant flow
 func (h *OAuthHandler) handleAuthorizationCodeGrant(w http.ResponseWriter, r *http.Request, req *models.TokenRequest, client *models.DynamicClient) {
 	// Retrieve authorization code data
-	codeData, err := h.getAuthorizationCodeData(req.Code)
+	originalCodeData, err := h.getAuthorizationCodeData(req.Code)
 	if err != nil {
 		h.logger.Warn().Err(err).Str("client_id", req.ClientID).Msg("Invalid authorization code")
 		h.writeJSONError(w, http.StatusBadRequest, models.ErrorInvalidGrant, "Invalid authorization code")
@@ -646,7 +661,7 @@ func (h *OAuthHandler) handleAuthorizationCodeGrant(w http.ResponseWriter, r *ht
 	}
 
 	// Validate code hasn't been used and hasn't expired
-	if codeData.Used || time.Now().After(codeData.ExpiresAt) {
+	if originalCodeData.Used || time.Now().After(originalCodeData.ExpiresAt) {
 		h.logger.LogSecurityEvent("expired_or_used_auth_code", getClientIP(r), getUserAgent(r), "high", map[string]interface{}{
 			"client_id": req.ClientID,
 			"code":      req.Code[:10] + "...",
@@ -656,16 +671,16 @@ func (h *OAuthHandler) handleAuthorizationCodeGrant(w http.ResponseWriter, r *ht
 	}
 
 	// Validate client and redirect URI
-	if codeData.ClientID != req.ClientID {
+	if originalCodeData.ClientID != req.ClientID {
 		h.logger.LogSecurityEvent("client_mismatch_auth_code", getClientIP(r), getUserAgent(r), "high", map[string]interface{}{
-			"expected_client": codeData.ClientID,
+			"expected_client": originalCodeData.ClientID,
 			"provided_client": req.ClientID,
 		})
 		h.writeJSONError(w, http.StatusBadRequest, models.ErrorInvalidGrant, "Client mismatch")
 		return
 	}
 
-	if codeData.RedirectURI != req.RedirectURI {
+	if originalCodeData.RedirectURI != req.RedirectURI {
 		h.writeJSONError(w, http.StatusBadRequest, models.ErrorInvalidGrant, "Redirect URI mismatch")
 		return
 	}
@@ -677,17 +692,35 @@ func (h *OAuthHandler) handleAuthorizationCodeGrant(w http.ResponseWriter, r *ht
 		h.logger.Debug().Msg("PKCE verification skipped in simplified implementation")
 	}
 
-	// Mark code as used
-	codeData.Used = true
-	h.sessionStore.Set("auth_code_"+req.Code, codeData, time.Minute) // Short TTL for used code
+	// Atomically mark code as used to prevent race conditions
+	usedCodeData := *originalCodeData // Create a copy
+	usedCodeData.Used = true
+
+	// Use CompareAndSet to atomically check and mark the code as used
+	success, err := h.sessionStore.CompareAndSet("auth_code_"+req.Code, originalCodeData, &usedCodeData, time.Minute)
+	if err != nil {
+		h.logger.Error().Err(err).Str("client_id", req.ClientID).Msg("Failed to update authorization code")
+		h.writeJSONError(w, http.StatusInternalServerError, models.ErrorServerError, "Internal server error")
+		return
+	}
+
+	if !success {
+		// Another request already used this code
+		h.logger.LogSecurityEvent("concurrent_auth_code_usage", getClientIP(r), getUserAgent(r), "high", map[string]interface{}{
+			"client_id": req.ClientID,
+			"code":      req.Code[:10] + "...",
+		})
+		h.writeJSONError(w, http.StatusBadRequest, models.ErrorInvalidGrant, "Authorization code already used")
+		return
+	}
 
 	// Return the Entra ID token directly
 	tokenResponse := &models.TokenResponse{
-		AccessToken:  codeData.EntraToken.AccessToken,
+		AccessToken:  originalCodeData.EntraToken.AccessToken,
 		TokenType:    models.TokenTypeBearer,
-		ExpiresIn:    int64(time.Until(codeData.EntraToken.Expiry).Seconds()),
-		RefreshToken: codeData.EntraToken.RefreshToken,
-		Scope:        codeData.Scope,
+		ExpiresIn:    int64(time.Until(originalCodeData.EntraToken.Expiry).Seconds()),
+		RefreshToken: originalCodeData.EntraToken.RefreshToken,
+		Scope:        originalCodeData.Scope,
 	}
 
 	h.logger.Info().
@@ -764,12 +797,12 @@ func getClientIP(r *http.Request) string {
 			return strings.TrimSpace(firstIP)
 		}
 	}
-	
+
 	// Check for X-Real-IP header (reverse proxy)
 	if xRealIP := r.Header.Get("X-Real-IP"); xRealIP != "" {
 		return xRealIP
 	}
-	
+
 	// Fall back to remote address
 	return strings.Split(r.RemoteAddr, ":")[0]
 }

@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/google/uuid"
+	"golang.org/x/crypto/bcrypt"
 )
 
 // Token Generation Utilities
@@ -46,6 +47,34 @@ func GenerateClientID() string {
 // GenerateClientSecret generates a secure client secret
 func GenerateClientSecret() (string, error) {
 	return GenerateSecureToken(48) // 384 bits of entropy
+}
+
+// HashClientSecret hashes a client secret using bcrypt
+func HashClientSecret(secret string) (string, error) {
+	if secret == "" {
+		return "", nil // Don't hash empty secrets (for public clients)
+	}
+	
+	hash, err := bcrypt.GenerateFromPassword([]byte(secret), bcrypt.DefaultCost)
+	if err != nil {
+		return "", fmt.Errorf("failed to hash client secret: %w", err)
+	}
+	
+	return string(hash), nil
+}
+
+// VerifyClientSecret verifies a client secret against its hash
+func VerifyClientSecret(secret, hash string) bool {
+	if secret == "" && hash == "" {
+		return true // Both empty (public client)
+	}
+	
+	if secret == "" || hash == "" {
+		return false // One empty, one not
+	}
+	
+	err := bcrypt.CompareHashAndPassword([]byte(hash), []byte(secret))
+	return err == nil
 }
 
 // GenerateState generates a secure state parameter

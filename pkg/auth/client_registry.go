@@ -163,7 +163,6 @@ func (r *memoryClientRegistry) RegisterClient(req *models.ClientRegistrationRequ
 	client := &models.DynamicClient{
 		ID:                      uuid.New().String(),
 		ClientID:                clientID,
-		ClientSecret:            clientSecret,
 		ClientName:              req.ClientName,
 		ClientURI:               req.ClientURI,
 		LogoURI:                 req.LogoURI,
@@ -181,6 +180,14 @@ func (r *memoryClientRegistry) RegisterClient(req *models.ClientRegistrationRequ
 		CreatedAt:               now,
 		UpdatedAt:               now,
 		IsActive:                true,
+	}
+
+	// Hash and set the client secret if it exists
+	if clientSecret != "" {
+		if err := client.SetClientSecret(clientSecret); err != nil {
+			r.logger.Error().Err(err).Msg("Failed to hash client secret")
+			return nil, fmt.Errorf("failed to process client secret: %w", err)
+		}
 	}
 
 	// Store client
@@ -202,7 +209,7 @@ func (r *memoryClientRegistry) RegisterClient(req *models.ClientRegistrationRequ
 
 	response := &models.ClientRegistrationResponse{
 		ClientID:                clientID,
-		ClientSecret:            clientSecret,
+		ClientSecret:            clientSecret, // Return the plain text secret, not the hash
 		ClientIDIssuedAt:        now.Unix(),
 		ClientSecretExpiresAt:   clientSecretExpiresAt,
 		RedirectURIs:            client.RedirectURIs,
@@ -285,7 +292,7 @@ func (r *memoryClientRegistry) UpdateClient(clientID string, req *models.ClientR
 
 	response := &models.ClientRegistrationResponse{
 		ClientID:                client.ClientID,
-		ClientSecret:            client.ClientSecret,
+		ClientSecret:            "", // Don't return the hashed secret for updates
 		ClientIDIssuedAt:        client.CreatedAt.Unix(),
 		ClientSecretExpiresAt:   clientSecretExpiresAt,
 		RedirectURIs:            client.RedirectURIs,
@@ -370,8 +377,8 @@ func (r *memoryClientRegistry) ValidateClient(clientID, clientSecret string) (*m
 		return client, nil
 	}
 
-	// For confidential clients, validate secret
-	if client.ClientSecret != clientSecret {
+	// For confidential clients, validate secret using bcrypt
+	if !client.VerifyClientSecret(clientSecret) {
 		r.logger.LogSecurityEvent("invalid_client_secret", "", "", "medium", map[string]interface{}{
 			"client_id": clientID,
 		})

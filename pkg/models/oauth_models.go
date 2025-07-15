@@ -140,6 +140,21 @@ func (c *DynamicClient) IsRedirectURIAllowed(redirectURI string) bool {
 	return false
 }
 
+// SetClientSecret hashes and sets the client secret
+func (c *DynamicClient) SetClientSecret(secret string) error {
+	hashedSecret, err := HashClientSecret(secret)
+	if err != nil {
+		return err
+	}
+	c.ClientSecret = hashedSecret
+	return nil
+}
+
+// VerifyClientSecret verifies a plain text secret against the stored hash
+func (c *DynamicClient) VerifyClientSecret(secret string) bool {
+	return VerifyClientSecret(secret, c.ClientSecret)
+}
+
 // Access Token Models
 
 // AccessTokenClaims represents validated JWT claims from Entra ID

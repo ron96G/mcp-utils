@@ -2,6 +2,7 @@ package storage
 
 import (
 	"fmt"
+	"reflect"
 	"sync"
 	"time"
 
@@ -16,6 +17,8 @@ type SessionStore interface {
 	Exists(key string) bool
 	Clear() error
 	GetStats() map[string]interface{}
+	// CompareAndSet atomically updates a value only if it matches the expected value
+	CompareAndSet(key string, expected, new interface{}, ttl time.Duration) (bool, error)
 }
 
 // SessionEntry represents a stored session entry
@@ -28,6 +31,11 @@ type SessionEntry struct {
 // IsExpired returns true if the session entry has expired
 func (se *SessionEntry) IsExpired() bool {
 	return time.Now().After(se.ExpiresAt)
+}
+
+// compareValues performs deep comparison of two values
+func compareValues(a, b interface{}) bool {
+	return reflect.DeepEqual(a, b)
 }
 
 // memorySessionStore implements SessionStore using in-memory storage
@@ -213,6 +221,56 @@ func (s *memorySessionStore) GetStats() map[string]interface{} {
 	}
 
 	return stats
+}
+
+// CompareAndSet atomically updates a value only if it matches the expected value
+func (s *memorySessionStore) CompareAndSet(key string, expected, new interface{}, ttl time.Duration) (bool, error) {
+	if key == "" {
+		return false, fmt.Errorf("key cannot be empty")
+	}
+
+	if ttl <= 0 {
+		return false, fmt.Errorf("TTL must be positive")
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	entry, exists := s.data[key]
+	if !exists {
+		return false, fmt.Errorf("key not found")
+	}
+
+	if entry.IsExpired() {
+		delete(s.data, key)
+		return false, fmt.Errorf("key expired")
+	}
+
+	// Compare the current value with expected value
+	// We use a deep comparison approach for the authorization code data
+	if !compareValues(entry.Value, expected) {
+		s.logger.Debug().
+			Str("key", key).
+			Msg("CompareAndSet failed: value mismatch")
+		return false, nil // Not an error, just didn't match
+	}
+
+	// Values match, update to new value
+	now := time.Now()
+	newEntry := &SessionEntry{
+		Value:     new,
+		ExpiresAt: now.Add(ttl),
+		CreatedAt: now,
+	}
+
+	s.data[key] = newEntry
+
+	s.logger.Debug().
+		Str("key", key).
+		Dur("ttl", ttl).
+		Msg("CompareAndSet succeeded")
+
+	return true, nil
 }
 
 // cleanupWorker periodically removes expired entries
