@@ -2,11 +2,10 @@ package handlers
 
 import (
 	"context"
-	"encoding/base64"
-	"encoding/json"
 	"fmt"
 	"strings"
 
+	"github.com/ron96g/mcp-utils/pkg/auth"
 	"github.com/ron96g/mcp-utils/pkg/config"
 	"github.com/ron96g/mcp-utils/pkg/log"
 	"github.com/ron96g/mcp-utils/pkg/models"
@@ -16,15 +15,28 @@ import (
 
 // DiscoveryHandler handles OAuth2 discovery endpoints
 type DiscoveryHandler struct {
-	config *config.Config
-	logger *log.Logger
+	config         *config.Config
+	logger         *log.Logger
+	tokenValidator auth.TokenValidator
 }
 
 // NewDiscoveryHandler creates a new discovery handler
 func NewDiscoveryHandler(cfg *config.Config) *DiscoveryHandler {
+	validatorConfig := &auth.TokenValidatorConfig{
+		TenantID: cfg.EntraID.TenantID,
+		Audience: cfg.EntraID.Audience,
+		Issuer:   cfg.GetEntraIDAuthority(),
+	}
+
+	tokenValidator, err := auth.NewTokenValidator(validatorConfig)
+	if err != nil {
+		log.L.Fatal().Err(err).Msg("Failed to initialize token validator")
+	}
+
 	return &DiscoveryHandler{
-		config: cfg,
-		logger: log.WithComponent("discovery_handler"),
+		config:         cfg,
+		logger:         log.WithComponent("discovery_handler"),
+		tokenValidator: tokenValidator,
 	}
 }
 
@@ -228,78 +240,68 @@ const (
 // AuthMiddleware creates a middleware for protecting endpoints
 func (h *DiscoveryHandler) AuthMiddleware() fiber.Handler {
 	return func(c *fiber.Ctx) error {
+		// Extract Authorization header
 		authHeader := c.Get("Authorization")
-
 		if authHeader == "" {
 			return h.Handle401Response(c, "", "invalid_request", "Missing Authorization header")
 		}
 
-		// Extract Bearer token
-		const bearerPrefix = "Bearer "
-		if len(authHeader) <= len(bearerPrefix) || authHeader[:len(bearerPrefix)] != bearerPrefix {
-			return h.Handle401Response(c, "", "invalid_request", "Invalid Authorization header format")
-		}
-
-		token := authHeader[len(bearerPrefix):]
-		if token == "" {
-			return h.Handle401Response(c, "", "invalid_token", "Missing access token")
-		}
-
-		claims, err := parseAccessToken(token, h.config.EntraID.Audience)
+		// Extract token from header
+		token, err := auth.ExtractTokenFromAuthHeader(authHeader)
 		if err != nil {
-			h.logger.Warn().
-				Err(err).
-				Interface("claims", claims).
-				Msg("Failed to parse access token")
-			// Return 401 with WWW-Authenticate header
-			return h.Handle401Response(c, "", "invalid_token", "Invalid access token")
+			return h.Handle401Response(c, "", "invalid_request", err.Error())
 		}
 
-		// Store token in context for use by handlers
-		c.Locals("access_token", token)
-		c.Locals("access_token_claims", claims)
+		// Validate token
+		result, err := h.tokenValidator.ValidateToken(token)
+		if err != nil {
+			h.logger.Error().
+				Err(err).
+				Str("client_ip", c.IP()).
+				Str("user_agent", c.Get("User-Agent")).
+				Msg("Token validation error")
+			return h.Handle401Response(c, "", "server_error", "Internal server error")
+		}
 
-		ctx := context.WithValue(c.Context(), SubjectKey, claims.Subject)
-		ctx = context.WithValue(ctx, NameKey, claims.Name)
-		ctx = context.WithValue(ctx, EmailKey, claims.Email)
+		if !result.Valid {
+			h.logger.Warn().
+				Str("error", result.Error).
+				Str("client_ip", c.IP()).
+				Str("user_agent", c.Get("User-Agent")).
+				Msg("Token validation failed")
+
+			// Determine appropriate error code based on validation error
+			errorCode := "invalid_token"
+			if result.Error != "" {
+				if strings.Contains(result.Error, "expired") {
+					errorCode = "invalid_token"
+				} else if strings.Contains(result.Error, "scope") {
+					errorCode = "insufficient_scope"
+				}
+			}
+
+			return h.Handle401Response(c, "", errorCode, result.Error)
+		}
+		// Store validated data in context
+		c.Locals("access_token", token)
+		c.Locals("access_token_claims", result.Claims)
+		c.Locals("token_scopes", result.Scopes)
+		c.Locals("token_roles", result.Roles)
+
+		// Set user context for easy access
+		ctx := context.WithValue(c.Context(), SubjectKey, result.Claims.Subject)
+		ctx = context.WithValue(ctx, NameKey, result.Claims.Name)
+		ctx = context.WithValue(ctx, EmailKey, result.Claims.GetEmailAddress())
 		c.SetUserContext(ctx)
-		c.Context()
+
+		h.logger.Debug().
+			Str("subject", result.Claims.Subject).
+			Str("name", result.Claims.Name).
+			Str("email", result.Claims.GetEmailAddress()).
+			Strs("scopes", result.Scopes).
+			Strs("roles", result.Roles).
+			Msg("Token validated successfully")
 
 		return c.Next()
 	}
-}
-
-type AccessTokenClaims struct {
-	Subject string `json:"sub"`
-	Name    string `json:"name"`
-	Email   string `json:"email"`
-	Aud     string `json:"aud"` // audience
-	Iss     string `json:"iss"` // issuer
-	Exp     int64  `json:"exp"` // expiration
-}
-
-func parseAccessToken(tokenString, expectedAud string) (*AccessTokenClaims, error) {
-	// Split JWT into parts
-	parts := strings.Split(tokenString, ".")
-	if len(parts) != 3 {
-		return nil, fmt.Errorf("invalid JWT format")
-	}
-
-	// Decode payload (second part)
-	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
-	if err != nil {
-		return nil, fmt.Errorf("failed to decode JWT payload: %v", err)
-	}
-
-	var claims AccessTokenClaims
-	if err := json.Unmarshal(payload, &claims); err != nil {
-		return nil, fmt.Errorf("failed to parse JWT claims: %v", err)
-	}
-
-	// Basic validation
-	if expectedAud != "" && claims.Aud != expectedAud {
-		return &claims, fmt.Errorf("invalid audience")
-	}
-
-	return &claims, nil
 }

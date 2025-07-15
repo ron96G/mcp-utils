@@ -1,10 +1,10 @@
 package models
 
 import (
-	"encoding/json"
+	"strings"
 	"time"
 
-	"golang.org/x/oauth2"
+	"github.com/golang-jwt/jwt/v5"
 )
 
 // OAuth2 Grant Types
@@ -140,6 +140,77 @@ func (c *DynamicClient) IsRedirectURIAllowed(redirectURI string) bool {
 	return false
 }
 
+// Access Token Models
+
+// AccessTokenClaims represents validated JWT claims from Entra ID
+type AccessTokenClaims struct {
+	jwt.RegisteredClaims
+
+	// Standard OIDC claims
+	Name              string `json:"name,omitempty"`
+	Email             string `json:"email,omitempty"`
+	PreferredUsername string `json:"preferred_username,omitempty"`
+
+	// Azure AD specific claims
+	TenantID         string `json:"tid,omitempty"`
+	ObjectID         string `json:"oid,omitempty"`
+	AppID            string `json:"appid,omitempty"`
+	AppDisplayName   string `json:"app_displayname,omitempty"`
+	IdentityProvider string `json:"idp,omitempty"`
+
+	// Scopes and roles
+	Scope  string   `json:"scp,omitempty"` // Space-separated scopes
+	Roles  []string `json:"roles,omitempty"`
+	Groups []string `json:"groups,omitempty"`
+
+	// Additional security claims
+	AuthenticationMethodsReferences []string `json:"amr,omitempty"`
+	AuthTime                        int64    `json:"auth_time,omitempty"`
+
+	// Application permissions
+	ApplicationPermissions []string `json:"app_perms,omitempty"`
+}
+
+// GetScopes returns scopes as a slice
+func (c *AccessTokenClaims) GetScopes() []string {
+	if c.Scope == "" {
+		return nil
+	}
+	return strings.Fields(c.Scope)
+}
+
+// HasScope checks if the token has a specific scope
+func (c *AccessTokenClaims) HasScope(scope string) bool {
+	scopes := c.GetScopes()
+	for _, s := range scopes {
+		if s == scope {
+			return true
+		}
+	}
+	return false
+}
+
+// HasRole checks if the token has a specific role
+func (c *AccessTokenClaims) HasRole(role string) bool {
+	for _, r := range c.Roles {
+		if r == role {
+			return true
+		}
+	}
+	return false
+}
+
+// GetEmailAddress returns the best available email address from claims
+func (c *AccessTokenClaims) GetEmailAddress() string {
+	if c.Email != "" {
+		return c.Email
+	}
+	if c.PreferredUsername != "" && strings.Contains(c.PreferredUsername, "@") {
+		return c.PreferredUsername
+	}
+	return ""
+}
+
 // OAuth2 Flow Models
 
 // AuthorizationRequest represents an OAuth2 authorization request
@@ -222,150 +293,6 @@ type PKCEChallenge struct {
 // IsExpired returns true if the PKCE challenge has expired
 func (p *PKCEChallenge) IsExpired() bool {
 	return time.Now().After(p.ExpiresAt)
-}
-
-// Authorization Code Models
-
-// AuthorizationCode represents an OAuth2 authorization code
-type AuthorizationCode struct {
-	ID               string                 `json:"id" db:"id"`
-	Code             string                 `json:"code" db:"code"`
-	ClientID         string                 `json:"client_id" db:"client_id"`
-	UserID           string                 `json:"user_id" db:"user_id"`
-	RedirectURI      string                 `json:"redirect_uri" db:"redirect_uri"`
-	Scope            string                 `json:"scope" db:"scope"`
-	State            string                 `json:"state" db:"state"`
-	Nonce            string                 `json:"nonce" db:"nonce"`
-	Resource         string                 `json:"resource" db:"resource"`
-	PKCEChallengeID  string                 `json:"pkce_challenge_id" db:"pkce_challenge_id"`
-	EntraIDToken     *oauth2.Token          `json:"-"`                                  // Don't serialize in JSON
-	EntraIDTokenJSON string                 `json:"entra_id_token" db:"entra_id_token"` // For storage
-	AdditionalClaims map[string]interface{} `json:"additional_claims" db:"additional_claims"`
-	CreatedAt        time.Time              `json:"created_at" db:"created_at"`
-	ExpiresAt        time.Time              `json:"expires_at" db:"expires_at"`
-	Used             bool                   `json:"used" db:"used"`
-}
-
-// IsExpired returns true if the authorization code has expired
-func (ac *AuthorizationCode) IsExpired() bool {
-	return time.Now().After(ac.ExpiresAt)
-}
-
-// SetEntraIDToken marshals the OAuth2 token to JSON for storage
-func (ac *AuthorizationCode) SetEntraIDToken(token *oauth2.Token) error {
-	ac.EntraIDToken = token
-	if token != nil {
-		tokenBytes, err := json.Marshal(token)
-		if err != nil {
-			return err
-		}
-		ac.EntraIDTokenJSON = string(tokenBytes)
-	}
-	return nil
-}
-
-// GetEntraIDToken unmarshals the stored JSON token
-func (ac *AuthorizationCode) GetEntraIDToken() (*oauth2.Token, error) {
-	if ac.EntraIDToken != nil {
-		return ac.EntraIDToken, nil
-	}
-
-	if ac.EntraIDTokenJSON != "" {
-		var token oauth2.Token
-		if err := json.Unmarshal([]byte(ac.EntraIDTokenJSON), &token); err != nil {
-			return nil, err
-		}
-		ac.EntraIDToken = &token
-		return &token, nil
-	}
-
-	return nil, nil
-}
-
-// Access Token Models
-
-// AccessToken represents an OAuth2 access token
-type AccessToken struct {
-	ID               string                 `json:"id" db:"id"`
-	Token            string                 `json:"token" db:"token"`
-	ClientID         string                 `json:"client_id" db:"client_id"`
-	UserID           string                 `json:"user_id" db:"user_id"`
-	Scope            string                 `json:"scope" db:"scope"`
-	Resource         string                 `json:"resource" db:"resource"`
-	TokenType        string                 `json:"token_type" db:"token_type"`
-	EntraIDToken     *oauth2.Token          `json:"-"`
-	EntraIDTokenJSON string                 `json:"entra_id_token" db:"entra_id_token"`
-	AdditionalClaims map[string]interface{} `json:"additional_claims" db:"additional_claims"`
-	CreatedAt        time.Time              `json:"created_at" db:"created_at"`
-	ExpiresAt        time.Time              `json:"expires_at" db:"expires_at"`
-	Revoked          bool                   `json:"revoked" db:"revoked"`
-}
-
-// IsExpired returns true if the access token has expired
-func (at *AccessToken) IsExpired() bool {
-	return time.Now().After(at.ExpiresAt)
-}
-
-// IsValid returns true if the token is not expired and not revoked
-func (at *AccessToken) IsValid() bool {
-	return !at.IsExpired() && !at.Revoked
-}
-
-// SetEntraIDToken marshals the OAuth2 token to JSON for storage
-func (at *AccessToken) SetEntraIDToken(token *oauth2.Token) error {
-	at.EntraIDToken = token
-	if token != nil {
-		tokenBytes, err := json.Marshal(token)
-		if err != nil {
-			return err
-		}
-		at.EntraIDTokenJSON = string(tokenBytes)
-	}
-	return nil
-}
-
-// GetEntraIDToken unmarshals the stored JSON token
-func (at *AccessToken) GetEntraIDToken() (*oauth2.Token, error) {
-	if at.EntraIDToken != nil {
-		return at.EntraIDToken, nil
-	}
-
-	if at.EntraIDTokenJSON != "" {
-		var token oauth2.Token
-		if err := json.Unmarshal([]byte(at.EntraIDTokenJSON), &token); err != nil {
-			return nil, err
-		}
-		at.EntraIDToken = &token
-		return &token, nil
-	}
-
-	return nil, nil
-}
-
-// Refresh Token Models
-
-// RefreshToken represents an OAuth2 refresh token
-type RefreshToken struct {
-	ID        string    `json:"id" db:"id"`
-	Token     string    `json:"token" db:"token"`
-	ClientID  string    `json:"client_id" db:"client_id"`
-	UserID    string    `json:"user_id" db:"user_id"`
-	Scope     string    `json:"scope" db:"scope"`
-	Resource  string    `json:"resource" db:"resource"`
-	CreatedAt time.Time `json:"created_at" db:"created_at"`
-	ExpiresAt time.Time `json:"expires_at" db:"expires_at"`
-	Used      bool      `json:"used" db:"used"`
-	Revoked   bool      `json:"revoked" db:"revoked"`
-}
-
-// IsExpired returns true if the refresh token has expired
-func (rt *RefreshToken) IsExpired() bool {
-	return time.Now().After(rt.ExpiresAt)
-}
-
-// IsValid returns true if the token is not expired, not used, and not revoked
-func (rt *RefreshToken) IsValid() bool {
-	return !rt.IsExpired() && !rt.Used && !rt.Revoked
 }
 
 // Discovery Models (RFC 8414, RFC 9728)

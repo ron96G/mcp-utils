@@ -3,8 +3,10 @@ module github.com/ron96g/mcp-utils
 go 1.23.0
 
 require (
+	github.com/MicahParks/keyfunc/v2 v2.1.0
 	github.com/go-playground/validator/v10 v10.27.0
 	github.com/gofiber/fiber/v2 v2.52.8
+	github.com/golang-jwt/jwt/v5 v5.2.2
 	github.com/google/uuid v1.6.0
 	github.com/mark3labs/mcp-go v0.33.0
 	github.com/pkg/errors v0.9.1

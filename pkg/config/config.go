@@ -182,7 +182,7 @@ func (c *Config) GetServerAddress() string {
 
 // GetEntraIDAuthority returns the complete Entra ID authority URL
 func (c *Config) GetEntraIDAuthority() string {
-	return fmt.Sprintf("%s/%s", c.EntraID.Authority, c.EntraID.TenantID)
+	return fmt.Sprintf("%s/%s/", c.EntraID.Authority, c.EntraID.TenantID)
 }
 
 // GetEntraIDTokenURL returns the Entra ID token endpoint URL
