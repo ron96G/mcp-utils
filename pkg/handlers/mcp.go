@@ -4,15 +4,14 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/gofiber/fiber/v2"
-	"github.com/gofiber/fiber/v2/middleware/adaptor"
+	"github.com/gorilla/mux"
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
 )
 
 var whoamiHandler server.ToolHandlerFunc = func(ctx context.Context, request mcp.CallToolRequest) (res *mcp.CallToolResult, err error) {
-	name := "John Doe"
-	email := "john.doe@example.com"
+	name := ctx.Value(ContextKeyName)
+	email := ctx.Value(ContextKeyEmail)
 	res = mcp.NewToolResultText(fmt.Sprintf("Hello, %s! Your email is %s.", name, email))
 
 	return res, nil
@@ -39,6 +38,6 @@ func NewMCPHandler() *MCPHandler {
 	return mcpHandler
 }
 
-func (h *MCPHandler) RegisterRoutes(app fiber.Router) {
-	app.All("/", adaptor.HTTPHandler(server.NewStreamableHTTPServer(h.mcpServer)))
+func (h *MCPHandler) RegisterRoutes(app *mux.Router) {
+	app.Handle("", server.NewStreamableHTTPServer(h.mcpServer))
 }

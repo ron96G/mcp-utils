@@ -1,7 +1,10 @@
 package handlers
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
+	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
@@ -13,7 +16,7 @@ import (
 	"github.com/ron96g/mcp-utils/pkg/models"
 
 	"github.com/go-playground/validator/v10"
-	"github.com/gofiber/fiber/v2"
+	"github.com/gorilla/mux"
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/microsoft"
 )
@@ -60,44 +63,46 @@ func NewOAuthHandler(cfg *config.Config, clientRegistry auth.ClientRegistry, pkc
 	}
 }
 
-// RegisterRoutes registers OAuth2 endpoints with the Fiber app
-func (h *OAuthHandler) RegisterRoutes(app *fiber.App) {
-	oauth := app.Group("/oauth2")
+// RegisterRoutes registers OAuth2 endpoints with the mux router
+func (h *OAuthHandler) RegisterRoutes(router *mux.Router) {
+	oauth := router.PathPrefix("/oauth2").Subrouter()
 
 	// Dynamic Client Registration (RFC 7591)
-	oauth.Post("/register", h.RegisterClient)
-	oauth.Get("/register/:client_id", h.GetClient)
-	oauth.Put("/register/:client_id", h.UpdateClient)
-	oauth.Delete("/register/:client_id", h.DeleteClient)
+	oauth.HandleFunc("/register", h.RegisterClient).Methods("POST")
+	oauth.HandleFunc("/register/{client_id}", h.GetClient).Methods("GET")
+	oauth.HandleFunc("/register/{client_id}", h.UpdateClient).Methods("PUT")
+	oauth.HandleFunc("/register/{client_id}", h.DeleteClient).Methods("DELETE")
 
 	// Authorization Flow
-	oauth.Get("/authorize", h.AuthorizeEndpoint)
-	oauth.Get("/callback", h.CallbackEndpoint)
-	oauth.Post("/token", h.TokenEndpoint)
-	oauth.Post("/revoke", h.RevokeEndpoint)
+	oauth.HandleFunc("/authorize", h.AuthorizeEndpoint).Methods("GET")
+	oauth.HandleFunc("/callback", h.CallbackEndpoint).Methods("GET")
+	oauth.HandleFunc("/token", h.TokenEndpoint).Methods("POST")
+	oauth.HandleFunc("/revoke", h.RevokeEndpoint).Methods("POST")
 }
 
 // RegisterClient handles dynamic client registration
-func (h *OAuthHandler) RegisterClient(c *fiber.Ctx) error {
+func (h *OAuthHandler) RegisterClient(w http.ResponseWriter, r *http.Request) {
 	var req models.ClientRegistrationRequest
-	if err := c.BodyParser(&req); err != nil {
+	if err := parseJSONBody(r, &req); err != nil {
 		h.logger.Warn().Err(err).Msg("Invalid client registration request")
-		return c.Status(fiber.StatusBadRequest).JSON(models.NewOAuth2Error(models.ErrorInvalidRequest, "Invalid request body"))
+		h.writeJSONError(w, http.StatusBadRequest, models.ErrorInvalidRequest, "Invalid request body")
+		return
 	}
 
 	// Log registration attempt
 	h.logger.Info().
 		Str("client_name", req.ClientName).
 		Int("redirect_uris_count", len(req.RedirectURIs)).
-		Str("user_agent", c.Get("User-Agent")).
-		Str("client_ip", c.IP()).
+		Str("user_agent", getUserAgent(r)).
+		Str("client_ip", getClientIP(r)).
 		Msg("Client registration request received")
 
 	// Register client
 	response, err := h.clientRegistry.RegisterClient(&req)
 	if err != nil {
 		h.logger.Error().Err(err).Msg("Client registration failed")
-		return c.Status(fiber.StatusBadRequest).JSON(models.NewOAuth2Error(models.ErrorInvalidClientMetadata, err.Error()))
+		h.writeJSONError(w, http.StatusBadRequest, models.ErrorInvalidClientMetadata, err.Error())
+		return
 	}
 
 	h.logger.Info().
@@ -105,16 +110,18 @@ func (h *OAuthHandler) RegisterClient(c *fiber.Ctx) error {
 		Str("client_name", response.ClientName).
 		Msg("Client registered successfully")
 
-	return c.Status(fiber.StatusCreated).JSON(response)
+	h.writeJSONResponse(w, http.StatusCreated, response)
 }
 
 // GetClient retrieves client information
-func (h *OAuthHandler) GetClient(c *fiber.Ctx) error {
-	clientID := c.Params("client_id")
+func (h *OAuthHandler) GetClient(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	clientID := vars["client_id"]
 
 	client, err := h.clientRegistry.GetClient(clientID)
 	if err != nil {
-		return c.Status(fiber.StatusNotFound).JSON(models.NewOAuth2Error(models.ErrorInvalidClient, "Client not found"))
+		h.writeJSONError(w, http.StatusNotFound, models.ErrorInvalidClient, "Client not found")
+		return
 	}
 
 	// Convert to registration response format (without sensitive data)
@@ -137,64 +144,70 @@ func (h *OAuthHandler) GetClient(c *fiber.Ctx) error {
 		SoftwareVersion:         client.SoftwareVersion,
 	}
 
-	return c.JSON(response)
+	h.writeJSONResponse(w, http.StatusOK, response)
 }
 
 // UpdateClient updates client information
-func (h *OAuthHandler) UpdateClient(c *fiber.Ctx) error {
-	clientID := c.Params("client_id")
+func (h *OAuthHandler) UpdateClient(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	clientID := vars["client_id"]
 
 	var req models.ClientRegistrationRequest
-	if err := c.BodyParser(&req); err != nil {
-		return c.Status(fiber.StatusBadRequest).JSON(models.NewOAuth2Error(models.ErrorInvalidRequest, "Invalid request body"))
+	if err := parseJSONBody(r, &req); err != nil {
+		h.writeJSONError(w, http.StatusBadRequest, models.ErrorInvalidRequest, "Invalid request body")
+		return
 	}
 
 	response, err := h.clientRegistry.UpdateClient(clientID, &req)
 	if err != nil {
 		if strings.Contains(err.Error(), "not found") {
-			return c.Status(fiber.StatusNotFound).JSON(models.NewOAuth2Error(models.ErrorInvalidClient, "Client not found"))
+			h.writeJSONError(w, http.StatusNotFound, models.ErrorInvalidClient, "Client not found")
 		} else {
-			return c.Status(fiber.StatusBadRequest).JSON(models.NewOAuth2Error(models.ErrorInvalidClientMetadata, err.Error()))
+			h.writeJSONError(w, http.StatusBadRequest, models.ErrorInvalidClientMetadata, err.Error())
 		}
+		return
 	}
 
-	return c.JSON(response)
+	h.writeJSONResponse(w, http.StatusOK, response)
 }
 
 // DeleteClient deletes a client
-func (h *OAuthHandler) DeleteClient(c *fiber.Ctx) error {
-	clientID := c.Params("client_id")
+func (h *OAuthHandler) DeleteClient(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	clientID := vars["client_id"]
 
 	err := h.clientRegistry.DeleteClient(clientID)
 	if err != nil {
-		return c.Status(fiber.StatusNotFound).JSON(models.NewOAuth2Error(models.ErrorInvalidClient, "Client not found"))
+		h.writeJSONError(w, http.StatusNotFound, models.ErrorInvalidClient, "Client not found")
+		return
 	}
 
-	return c.SendStatus(fiber.StatusNoContent)
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // AuthorizeEndpoint handles OAuth2 authorization requests
-func (h *OAuthHandler) AuthorizeEndpoint(c *fiber.Ctx) error {
+func (h *OAuthHandler) AuthorizeEndpoint(w http.ResponseWriter, r *http.Request) {
 	// Parse authorization request from query parameters
+	query := r.URL.Query()
 	req := models.AuthorizationRequest{
-		ResponseType:        c.Query("response_type"),
-		ClientID:            c.Query("client_id"),
-		RedirectURI:         c.Query("redirect_uri"),
-		Scope:               c.Query("scope"),
-		State:               c.Query("state"),
-		CodeChallenge:       c.Query("code_challenge"),
-		CodeChallengeMethod: c.Query("code_challenge_method"),
-		Resource:            c.Query("resource"),
-		Nonce:               c.Query("nonce"),
-		Prompt:              c.Query("prompt"),
-		UILocales:           c.Query("ui_locales"),
-		IDTokenHint:         c.Query("id_token_hint"),
-		LoginHint:           c.Query("login_hint"),
-		ACRValues:           c.Query("acr_values"),
+		ResponseType:        query.Get("response_type"),
+		ClientID:            query.Get("client_id"),
+		RedirectURI:         query.Get("redirect_uri"),
+		Scope:               query.Get("scope"),
+		State:               query.Get("state"),
+		CodeChallenge:       query.Get("code_challenge"),
+		CodeChallengeMethod: query.Get("code_challenge_method"),
+		Resource:            query.Get("resource"),
+		Nonce:               query.Get("nonce"),
+		Prompt:              query.Get("prompt"),
+		UILocales:           query.Get("ui_locales"),
+		IDTokenHint:         query.Get("id_token_hint"),
+		LoginHint:           query.Get("login_hint"),
+		ACRValues:           query.Get("acr_values"),
 	}
 
 	// Parse max_age if provided
-	if maxAgeStr := c.Query("max_age"); maxAgeStr != "" {
+	if maxAgeStr := query.Get("max_age"); maxAgeStr != "" {
 		if maxAge, err := strconv.Atoi(maxAgeStr); err == nil {
 			req.MaxAge = maxAge
 		}
@@ -203,7 +216,8 @@ func (h *OAuthHandler) AuthorizeEndpoint(c *fiber.Ctx) error {
 	// Validate request
 	if err := h.validator.Struct(&req); err != nil {
 		h.logger.Warn().Err(err).Msg("Authorization request validation failed")
-		return h.redirectError(c, req.RedirectURI, req.State, models.ErrorInvalidRequest, err.Error())
+		h.redirectError(w, r, req.RedirectURI, req.State, models.ErrorInvalidRequest, err.Error())
+		return
 	}
 
 	h.logger.Info().
@@ -212,8 +226,8 @@ func (h *OAuthHandler) AuthorizeEndpoint(c *fiber.Ctx) error {
 		Str("scope", req.Scope).
 		Str("redirect_uri", req.RedirectURI).
 		Bool("has_pkce", req.RequiresPKCE()).
-		Str("user_agent", c.Get("User-Agent")).
-		Str("client_ip", c.IP()).
+		Str("user_agent", getUserAgent(r)).
+		Str("client_ip", getClientIP(r)).
 		Msg("Authorization request received")
 
 	// Validate client
@@ -223,22 +237,25 @@ func (h *OAuthHandler) AuthorizeEndpoint(c *fiber.Ctx) error {
 			Str("client_id", req.ClientID).
 			Err(err).
 			Msg("Invalid client in authorization request")
-		return h.redirectError(c, req.RedirectURI, req.State, models.ErrorUnauthorizedClient, "Invalid client")
+		h.redirectError(w, r, req.RedirectURI, req.State, models.ErrorUnauthorizedClient, "Invalid client")
+		return
 	}
 
 	// Validate redirect URI
 	if !client.IsRedirectURIAllowed(req.RedirectURI) {
-		h.logger.LogSecurityEvent("invalid_redirect_uri", c.IP(), c.Get("User-Agent"), "high", map[string]interface{}{
+		h.logger.LogSecurityEvent("invalid_redirect_uri", getClientIP(r), getUserAgent(r), "high", map[string]interface{}{
 			"client_id":    req.ClientID,
 			"redirect_uri": req.RedirectURI,
 			"allowed_uris": client.RedirectURIs,
 		})
-		return c.Status(fiber.StatusBadRequest).JSON(models.NewOAuth2Error(models.ErrorInvalidRedirectURI, "Invalid redirect URI"))
+		h.writeJSONError(w, http.StatusBadRequest, models.ErrorInvalidRedirectURI, "Invalid redirect URI")
+		return
 	}
 
 	// Validate response type
 	if !client.SupportsResponseType(req.ResponseType) {
-		return h.redirectError(c, req.RedirectURI, req.State, models.ErrorUnsupportedResponseType, "Unsupported response type")
+		h.redirectError(w, r, req.RedirectURI, req.State, models.ErrorUnsupportedResponseType, "Unsupported response type")
+		return
 	}
 
 	// Validate and store PKCE challenge if present
@@ -247,13 +264,15 @@ func (h *OAuthHandler) AuthorizeEndpoint(c *fiber.Ctx) error {
 			h.logger.Warn().Err(err).
 				Str("client_id", req.ClientID).
 				Msg("PKCE validation failed")
-			return h.redirectError(c, req.RedirectURI, req.State, models.ErrorInvalidRequest, "Invalid PKCE parameters")
+			h.redirectError(w, r, req.RedirectURI, req.State, models.ErrorInvalidRequest, "Invalid PKCE parameters")
+			return
 		}
 	} else if h.config.OAuth.RequirePKCE {
 		h.logger.Warn().
 			Str("client_id", req.ClientID).
 			Msg("PKCE required but not provided")
-		return h.redirectError(c, req.RedirectURI, req.State, models.ErrorInvalidRequest, "PKCE is required")
+		h.redirectError(w, r, req.RedirectURI, req.State, models.ErrorInvalidRequest, "PKCE is required")
+		return
 	}
 
 	// Store authorization session for callback
@@ -266,7 +285,8 @@ func (h *OAuthHandler) AuthorizeEndpoint(c *fiber.Ctx) error {
 
 	if err := h.sessionStore.Set(sessionKey, sessionData, 10*time.Minute); err != nil {
 		h.logger.Error().Err(err).Msg("Failed to store authorization session")
-		return h.redirectError(c, req.RedirectURI, req.State, models.ErrorServerError, "Internal server error")
+		h.redirectError(w, r, req.RedirectURI, req.State, models.ErrorServerError, "Internal server error")
+		return
 	}
 
 	// Build Entra ID authorization URL
@@ -294,15 +314,16 @@ func (h *OAuthHandler) AuthorizeEndpoint(c *fiber.Ctx) error {
 		Msg("Redirecting to Entra ID for authentication")
 
 	// Redirect to Entra ID
-	return c.Redirect(entraAuthURL, fiber.StatusFound)
+	http.Redirect(w, r, entraAuthURL, http.StatusFound)
 }
 
 // CallbackEndpoint handles the callback from Entra ID
-func (h *OAuthHandler) CallbackEndpoint(c *fiber.Ctx) error {
-	code := c.Query("code")
-	state := c.Query("state")
-	errorParam := c.Query("error")
-	errorDescription := c.Query("error_description")
+func (h *OAuthHandler) CallbackEndpoint(w http.ResponseWriter, r *http.Request) {
+	query := r.URL.Query()
+	code := query.Get("code")
+	state := query.Get("state")
+	errorParam := query.Get("error")
+	errorDescription := query.Get("error_description")
 
 	h.logger.Info().
 		Str("state", state).
@@ -320,28 +341,33 @@ func (h *OAuthHandler) CallbackEndpoint(c *fiber.Ctx) error {
 		// Retrieve session to get original redirect URI
 		sessionData, err := h.getAuthorizationSession(state)
 		if err != nil {
-			return c.Status(fiber.StatusBadRequest).SendString("Invalid session")
+			http.Error(w, "Invalid session", http.StatusBadRequest)
+			return
 		}
 
-		return h.redirectError(c, sessionData.Request.RedirectURI, sessionData.Request.State, errorParam, errorDescription)
+		h.redirectError(w, r, sessionData.Request.RedirectURI, sessionData.Request.State, errorParam, errorDescription)
+		return
 	}
 
 	if code == "" {
-		return c.Status(fiber.StatusBadRequest).SendString("Missing authorization code")
+		http.Error(w, "Missing authorization code", http.StatusBadRequest)
+		return
 	}
 
 	// Retrieve authorization session
 	sessionData, err := h.getAuthorizationSession(state)
 	if err != nil {
 		h.logger.Error().Err(err).Str("state", state).Msg("Failed to retrieve authorization session")
-		return c.Status(fiber.StatusBadRequest).SendString("Invalid or expired session")
+		http.Error(w, "Invalid or expired session", http.StatusBadRequest)
+		return
 	}
 
 	// Exchange code for token with Entra ID
-	token, err := h.entraConfig.Exchange(c.Context(), code)
+	token, err := h.entraConfig.Exchange(context.Background(), code)
 	if err != nil {
 		h.logger.Error().Err(err).Msg("Failed to exchange code with Entra ID")
-		return h.redirectError(c, sessionData.Request.RedirectURI, sessionData.Request.State, models.ErrorServerError, "Failed to exchange authorization code")
+		h.redirectError(w, r, sessionData.Request.RedirectURI, sessionData.Request.State, models.ErrorServerError, "Failed to exchange authorization code")
+		return
 	}
 
 	h.logger.Info().
@@ -354,7 +380,8 @@ func (h *OAuthHandler) CallbackEndpoint(c *fiber.Ctx) error {
 	mcpAuthCode, err := h.generateAuthorizationCode(sessionData, token)
 	if err != nil {
 		h.logger.Error().Err(err).Msg("Failed to generate MCP authorization code")
-		return h.redirectError(c, sessionData.Request.RedirectURI, sessionData.Request.State, models.ErrorServerError, "Failed to generate authorization code")
+		h.redirectError(w, r, sessionData.Request.RedirectURI, sessionData.Request.State, models.ErrorServerError, "Failed to generate authorization code")
+		return
 	}
 
 	// Clean up session
@@ -364,41 +391,50 @@ func (h *OAuthHandler) CallbackEndpoint(c *fiber.Ctx) error {
 	redirectURL, err := url.Parse(sessionData.Request.RedirectURI)
 	if err != nil {
 		h.logger.Error().Err(err).Msg("Invalid redirect URI")
-		return c.Status(fiber.StatusBadRequest).SendString("Invalid redirect URI")
+		http.Error(w, "Invalid redirect URI", http.StatusBadRequest)
+		return
 	}
 
-	query := redirectURL.Query()
-	query.Set("code", mcpAuthCode)
-	query.Set("state", sessionData.Request.State)
-	redirectURL.RawQuery = query.Encode()
+	queryParams := redirectURL.Query()
+	queryParams.Set("code", mcpAuthCode)
+	queryParams.Set("state", sessionData.Request.State)
+	redirectURL.RawQuery = queryParams.Encode()
 
 	h.logger.Info().
 		Str("client_id", sessionData.Request.ClientID).
 		Str("redirect_uri", redirectURL.String()).
 		Msg("Redirecting back to client with authorization code")
 
-	return c.Redirect(redirectURL.String(), fiber.StatusFound)
+	http.Redirect(w, r, redirectURL.String(), http.StatusFound)
 }
 
 // TokenEndpoint handles OAuth2 token requests
-func (h *OAuthHandler) TokenEndpoint(c *fiber.Ctx) error {
+func (h *OAuthHandler) TokenEndpoint(w http.ResponseWriter, r *http.Request) {
+	// Parse form data
+	if err := r.ParseForm(); err != nil {
+		h.logger.Warn().Err(err).Msg("Failed to parse form data")
+		h.writeJSONError(w, http.StatusBadRequest, models.ErrorInvalidRequest, "Invalid form data")
+		return
+	}
+
 	// Parse token request
 	req := models.TokenRequest{
-		GrantType:    c.FormValue("grant_type"),
-		Code:         c.FormValue("code"),
-		RedirectURI:  c.FormValue("redirect_uri"),
-		ClientID:     c.FormValue("client_id"),
-		ClientSecret: c.FormValue("client_secret"),
-		RefreshToken: c.FormValue("refresh_token"),
-		Scope:        c.FormValue("scope"),
-		CodeVerifier: c.FormValue("code_verifier"),
-		Resource:     c.FormValue("resource"),
+		GrantType:    r.FormValue("grant_type"),
+		Code:         r.FormValue("code"),
+		RedirectURI:  r.FormValue("redirect_uri"),
+		ClientID:     r.FormValue("client_id"),
+		ClientSecret: r.FormValue("client_secret"),
+		RefreshToken: r.FormValue("refresh_token"),
+		Scope:        r.FormValue("scope"),
+		CodeVerifier: r.FormValue("code_verifier"),
+		Resource:     r.FormValue("resource"),
 	}
 
 	// Validate request
 	if err := h.validator.Struct(&req); err != nil {
 		h.logger.Warn().Err(err).Msg("Token request validation failed")
-		return c.Status(fiber.StatusBadRequest).JSON(models.NewOAuth2Error(models.ErrorInvalidRequest, err.Error()))
+		h.writeJSONError(w, http.StatusBadRequest, models.ErrorInvalidRequest, err.Error())
+		return
 	}
 
 	h.logger.Info().
@@ -412,53 +448,63 @@ func (h *OAuthHandler) TokenEndpoint(c *fiber.Ctx) error {
 	// Validate client
 	client, err := h.clientRegistry.ValidateClient(req.ClientID, req.ClientSecret)
 	if err != nil {
-		h.logger.LogSecurityEvent("invalid_client_credentials", c.IP(), c.Get("User-Agent"), "high", map[string]interface{}{
+		h.logger.LogSecurityEvent("invalid_client_credentials", getClientIP(r), getUserAgent(r), "high", map[string]interface{}{
 			"client_id":  req.ClientID,
 			"grant_type": req.GrantType,
 		})
-		return c.Status(fiber.StatusUnauthorized).JSON(models.NewOAuth2Error(models.ErrorInvalidClient, "Invalid client credentials"))
+		h.writeJSONError(w, http.StatusUnauthorized, models.ErrorInvalidClient, "Invalid client credentials")
+		return
 	}
 
 	// Handle different grant types
 	switch req.GrantType {
 	case models.GrantTypeAuthorizationCode:
-		return h.handleAuthorizationCodeGrant(c, &req, client)
+		h.handleAuthorizationCodeGrant(w, r, &req, client)
 	case models.GrantTypeRefreshToken:
-		return h.handleRefreshTokenGrant(c, &req, client)
+		h.handleRefreshTokenGrant(w, r, &req, client)
 	default:
-		return c.Status(fiber.StatusBadRequest).JSON(models.NewOAuth2Error(models.ErrorUnsupportedGrantType, "Unsupported grant type"))
+		h.writeJSONError(w, http.StatusBadRequest, models.ErrorUnsupportedGrantType, "Unsupported grant type")
 	}
 }
 
 // RevokeEndpoint handles token revocation (RFC 7009)
-func (h *OAuthHandler) RevokeEndpoint(c *fiber.Ctx) error {
-	token := c.FormValue("token")
-	tokenTypeHint := c.FormValue("token_type_hint")
-	clientID := c.FormValue("client_id")
-	clientSecret := c.FormValue("client_secret")
+func (h *OAuthHandler) RevokeEndpoint(w http.ResponseWriter, r *http.Request) {
+	// Parse form data
+	if err := r.ParseForm(); err != nil {
+		h.logger.Warn().Err(err).Msg("Failed to parse form data")
+		h.writeJSONError(w, http.StatusBadRequest, models.ErrorInvalidRequest, "Invalid form data")
+		return
+	}
+
+	token := r.FormValue("token")
+	tokenTypeHint := r.FormValue("token_type_hint")
+	clientID := r.FormValue("client_id")
+	clientSecret := r.FormValue("client_secret")
 
 	h.logger.Info().
 		Str("token_type_hint", tokenTypeHint).
 		Str("client_id", clientID).
 		Bool("has_token", token != "").
 		Bool("has_client_secret", clientSecret != "").
-		Str("client_ip", c.IP()).
-		Str("user_agent", c.Get("User-Agent")).
+		Str("client_ip", getClientIP(r)).
+		Str("user_agent", getUserAgent(r)).
 		Msg("Token revocation requested")
 
 	if token == "" {
-		return c.Status(fiber.StatusBadRequest).JSON(models.NewOAuth2Error(models.ErrorInvalidRequest, "Missing token parameter"))
+		h.writeJSONError(w, http.StatusBadRequest, models.ErrorInvalidRequest, "Missing token parameter")
+		return
 	}
 
 	// Validate client if credentials provided
 	if clientID != "" {
 		client, err := h.clientRegistry.ValidateClient(clientID, clientSecret)
 		if err != nil {
-			h.logger.LogSecurityEvent("invalid_client_revocation", c.IP(), c.Get("User-Agent"), "medium", map[string]interface{}{
+			h.logger.LogSecurityEvent("invalid_client_revocation", getClientIP(r), getUserAgent(r), "medium", map[string]interface{}{
 				"client_id": clientID,
 				"error":     err.Error(),
 			})
-			return c.Status(fiber.StatusUnauthorized).JSON(models.NewOAuth2Error(models.ErrorInvalidClient, "Invalid client credentials"))
+			h.writeJSONError(w, http.StatusUnauthorized, models.ErrorInvalidClient, "Invalid client credentials")
+			return
 		}
 
 		h.logger.Debug().
@@ -471,7 +517,7 @@ func (h *OAuthHandler) RevokeEndpoint(c *fiber.Ctx) error {
 
 	// RFC 7009: The authorization server responds with HTTP status code 200 if the token
 	// has been revoked successfully or if the client submitted an invalid token.
-	return c.SendStatus(fiber.StatusOK)
+	w.WriteHeader(http.StatusOK)
 }
 
 // Helper methods
@@ -484,14 +530,16 @@ type AuthorizationSession struct {
 }
 
 // redirectError redirects with OAuth2 error parameters
-func (h *OAuthHandler) redirectError(c *fiber.Ctx, redirectURI, state, errorCode, errorDescription string) error {
+func (h *OAuthHandler) redirectError(w http.ResponseWriter, r *http.Request, redirectURI, state, errorCode, errorDescription string) {
 	if redirectURI == "" {
-		return c.Status(fiber.StatusBadRequest).JSON(models.NewOAuth2Error(errorCode, errorDescription))
+		h.writeJSONError(w, http.StatusBadRequest, errorCode, errorDescription)
+		return
 	}
 
 	redirectURL, err := url.Parse(redirectURI)
 	if err != nil {
-		return c.Status(fiber.StatusBadRequest).JSON(models.NewOAuth2Error(models.ErrorInvalidRedirectURI, "Invalid redirect URI"))
+		h.writeJSONError(w, http.StatusBadRequest, models.ErrorInvalidRedirectURI, "Invalid redirect URI")
+		return
 	}
 
 	query := redirectURL.Query()
@@ -504,7 +552,7 @@ func (h *OAuthHandler) redirectError(c *fiber.Ctx, redirectURI, state, errorCode
 	}
 	redirectURL.RawQuery = query.Encode()
 
-	return c.Redirect(redirectURL.String(), fiber.StatusFound)
+	http.Redirect(w, r, redirectURL.String(), http.StatusFound)
 }
 
 // validateAndStorePKCE validates PKCE parameters and stores the challenge
@@ -588,34 +636,38 @@ type AuthorizationCodeData struct {
 }
 
 // handleAuthorizationCodeGrant handles authorization code grant flow
-func (h *OAuthHandler) handleAuthorizationCodeGrant(c *fiber.Ctx, req *models.TokenRequest, client *models.DynamicClient) error {
+func (h *OAuthHandler) handleAuthorizationCodeGrant(w http.ResponseWriter, r *http.Request, req *models.TokenRequest, client *models.DynamicClient) {
 	// Retrieve authorization code data
 	codeData, err := h.getAuthorizationCodeData(req.Code)
 	if err != nil {
 		h.logger.Warn().Err(err).Str("client_id", req.ClientID).Msg("Invalid authorization code")
-		return c.Status(fiber.StatusBadRequest).JSON(models.NewOAuth2Error(models.ErrorInvalidGrant, "Invalid authorization code"))
+		h.writeJSONError(w, http.StatusBadRequest, models.ErrorInvalidGrant, "Invalid authorization code")
+		return
 	}
 
 	// Validate code hasn't been used and hasn't expired
 	if codeData.Used || time.Now().After(codeData.ExpiresAt) {
-		h.logger.LogSecurityEvent("expired_or_used_auth_code", c.IP(), c.Get("User-Agent"), "high", map[string]interface{}{
+		h.logger.LogSecurityEvent("expired_or_used_auth_code", getClientIP(r), getUserAgent(r), "high", map[string]interface{}{
 			"client_id": req.ClientID,
 			"code":      req.Code[:10] + "...",
 		})
-		return c.Status(fiber.StatusBadRequest).JSON(models.NewOAuth2Error(models.ErrorInvalidGrant, "Authorization code expired or already used"))
+		h.writeJSONError(w, http.StatusBadRequest, models.ErrorInvalidGrant, "Authorization code expired or already used")
+		return
 	}
 
 	// Validate client and redirect URI
 	if codeData.ClientID != req.ClientID {
-		h.logger.LogSecurityEvent("client_mismatch_auth_code", c.IP(), c.Get("User-Agent"), "high", map[string]interface{}{
+		h.logger.LogSecurityEvent("client_mismatch_auth_code", getClientIP(r), getUserAgent(r), "high", map[string]interface{}{
 			"expected_client": codeData.ClientID,
 			"provided_client": req.ClientID,
 		})
-		return c.Status(fiber.StatusBadRequest).JSON(models.NewOAuth2Error(models.ErrorInvalidGrant, "Client mismatch"))
+		h.writeJSONError(w, http.StatusBadRequest, models.ErrorInvalidGrant, "Client mismatch")
+		return
 	}
 
 	if codeData.RedirectURI != req.RedirectURI {
-		return c.Status(fiber.StatusBadRequest).JSON(models.NewOAuth2Error(models.ErrorInvalidGrant, "Redirect URI mismatch"))
+		h.writeJSONError(w, http.StatusBadRequest, models.ErrorInvalidGrant, "Redirect URI mismatch")
+		return
 	}
 
 	// Verify PKCE if required
@@ -644,11 +696,11 @@ func (h *OAuthHandler) handleAuthorizationCodeGrant(c *fiber.Ctx, req *models.To
 		Int64("expires_in", tokenResponse.ExpiresIn).
 		Msg("Access token issued successfully")
 
-	return c.JSON(tokenResponse)
+	h.writeJSONResponse(w, http.StatusOK, tokenResponse)
 }
 
 // handleRefreshTokenGrant handles refresh token grant flow
-func (h *OAuthHandler) handleRefreshTokenGrant(c *fiber.Ctx, req *models.TokenRequest, client *models.DynamicClient) error {
+func (h *OAuthHandler) handleRefreshTokenGrant(w http.ResponseWriter, r *http.Request, req *models.TokenRequest, client *models.DynamicClient) {
 	// For direct Entra ID tokens, we'd need to refresh with Entra ID
 	// This is simplified for now
 
@@ -661,7 +713,7 @@ func (h *OAuthHandler) handleRefreshTokenGrant(c *fiber.Ctx, req *models.TokenRe
 	// 2. Call Entra ID to refresh the token
 	// 3. Return the new tokens
 
-	return c.Status(fiber.StatusNotImplemented).JSON(models.NewOAuth2Error(models.ErrorUnsupportedGrantType, "Refresh token grant not implemented yet"))
+	h.writeJSONError(w, http.StatusNotImplemented, models.ErrorUnsupportedGrantType, "Refresh token grant not implemented yet")
 }
 
 // getAuthorizationCodeData retrieves authorization code data
@@ -687,4 +739,48 @@ func generateRandomString(length int) string {
 		result[i] = charset[time.Now().UnixNano()%int64(len(charset))]
 	}
 	return string(result)
+}
+
+// HTTP utility functions for standard library conversion
+
+// writeJSONResponse writes a JSON response with the given status code
+func (h *OAuthHandler) writeJSONResponse(w http.ResponseWriter, statusCode int, data interface{}) error {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(statusCode)
+	return json.NewEncoder(w).Encode(data)
+}
+
+// writeJSONError writes a JSON error response
+func (h *OAuthHandler) writeJSONError(w http.ResponseWriter, statusCode int, errorCode, errorDescription string) error {
+	return h.writeJSONResponse(w, statusCode, models.NewOAuth2Error(errorCode, errorDescription))
+}
+
+// getClientIP extracts the client IP address from the request
+func getClientIP(r *http.Request) string {
+	// Check for X-Forwarded-For header (load balancer/proxy)
+	if xForwardedFor := r.Header.Get("X-Forwarded-For"); xForwardedFor != "" {
+		// Take the first IP in the list
+		if firstIP := strings.Split(xForwardedFor, ",")[0]; firstIP != "" {
+			return strings.TrimSpace(firstIP)
+		}
+	}
+	
+	// Check for X-Real-IP header (reverse proxy)
+	if xRealIP := r.Header.Get("X-Real-IP"); xRealIP != "" {
+		return xRealIP
+	}
+	
+	// Fall back to remote address
+	return strings.Split(r.RemoteAddr, ":")[0]
+}
+
+// getUserAgent extracts the User-Agent from the request
+func getUserAgent(r *http.Request) string {
+	return r.Header.Get("User-Agent")
+}
+
+// parseJSONBody parses JSON request body into the given struct
+func parseJSONBody(r *http.Request, target interface{}) error {
+	decoder := json.NewDecoder(r.Body)
+	return decoder.Decode(target)
 }

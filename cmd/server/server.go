@@ -2,8 +2,8 @@ package main
 
 import (
 	"context"
-	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
@@ -15,11 +15,7 @@ import (
 	"github.com/ron96g/mcp-utils/pkg/log"
 	"github.com/ron96g/mcp-utils/pkg/storage"
 
-	"github.com/gofiber/fiber/v2"
-	"github.com/gofiber/fiber/v2/middleware/compress"
-	"github.com/gofiber/fiber/v2/middleware/helmet"
-	"github.com/gofiber/fiber/v2/middleware/logger"
-	"github.com/gofiber/fiber/v2/middleware/recover"
+	"github.com/gorilla/mux"
 )
 
 func main() {
@@ -61,8 +57,8 @@ func initializeServer(cfg *config.Config, logger *log.Logger) error {
 	pkceConfig := auth.DefaultPKCEConfig()
 	pkceManager := auth.NewMemoryPKCEManager(pkceConfig)
 
-	// Create Fiber app
-	app := createFiberApp(cfg, logger)
+	// Create router
+	router := mux.NewRouter()
 
 	// Initialize handlers
 	discoveryHandler := handlers.NewDiscoveryHandler(cfg)
@@ -70,94 +66,134 @@ func initializeServer(cfg *config.Config, logger *log.Logger) error {
 	mcpHandler := handlers.NewMCPHandler()
 
 	// Register middleware
-	registerMiddleware(app, cfg, discoveryHandler)
+	registerMiddleware(router, logger)
 
 	// Register routes
-	registerRoutes(app, discoveryHandler, oauthHandler, mcpHandler)
+	registerRoutes(router, discoveryHandler, oauthHandler, mcpHandler)
 
-	// Start server
-	return startServer(app, cfg, logger)
-}
-
-// createFiberApp creates and configures the Fiber application
-func createFiberApp(cfg *config.Config, logger *log.Logger) *fiber.App {
-	// Configure Fiber
-	fiberConfig := fiber.Config{
-		ServerHeader:          cfg.Logging.ServiceName,
-		AppName:               fmt.Sprintf("%s v%s", cfg.Logging.ServiceName, cfg.Logging.ServiceVersion),
-		DisableStartupMessage: true,
-		ReadTimeout:           cfg.Server.ReadTimeout,
-		WriteTimeout:          cfg.Server.WriteTimeout,
-		IdleTimeout:           cfg.Server.IdleTimeout,
-		ErrorHandler:          createErrorHandler(logger),
+	// Create HTTP server
+	server := &http.Server{
+		Addr:         cfg.GetServerAddress(),
+		Handler:      router,
+		ReadTimeout:  cfg.Server.ReadTimeout,
+		WriteTimeout: cfg.Server.WriteTimeout,
+		IdleTimeout:  cfg.Server.IdleTimeout,
 	}
 
-	return fiber.New(fiberConfig)
+	// Start server
+	return startServer(server, cfg, logger)
 }
 
-// createErrorHandler creates a custom error handler for Fiber
-func createErrorHandler(logger *log.Logger) fiber.ErrorHandler {
-	return func(c *fiber.Ctx, err error) error {
-		// Default 500 status code
-		code := fiber.StatusInternalServerError
-
-		// Retrieve the custom status code if it's a *fiber.Error
-		var e *fiber.Error
-		if errors.As(err, &e) {
-			code = e.Code
-		}
-
+// createErrorHandler creates a custom error handler for HTTP
+func createErrorHandler(logger *log.Logger) func(http.ResponseWriter, *http.Request, int, error) {
+	return func(w http.ResponseWriter, r *http.Request, statusCode int, err error) {
 		// Log the error
 		logger.Error().
 			Err(err).
-			Int("status_code", code).
-			Str("method", c.Method()).
-			Str("path", c.Path()).
-			Str("client_ip", c.IP()).
-			Str("user_agent", c.Get("User-Agent")).
+			Int("status_code", statusCode).
+			Str("method", r.Method).
+			Str("path", r.URL.Path).
+			Str("client_ip", r.RemoteAddr).
+			Str("user_agent", r.UserAgent()).
 			Msg("Request error")
 
-		// Return status code with error message
-		return c.Status(code).JSON(fiber.Map{
-			"error":   true,
-			"message": err.Error(),
-		})
+		// Set content type and return error response
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(statusCode)
+		fmt.Fprintf(w, `{"error": true, "message": "%s"}`, err.Error())
 	}
 }
 
 // registerMiddleware registers global middleware
-func registerMiddleware(app *fiber.App, cfg *config.Config, discoveryHandler *handlers.DiscoveryHandler) {
-	// Security middleware
-	app.Use(helmet.New())
+func registerMiddleware(router *mux.Router, logger *log.Logger) {
+	// Create middleware chain
+	router.Use(securityMiddleware)
+	router.Use(recoveryMiddleware)
+	router.Use(loggingMiddleware(logger))
+	router.Use(compressionMiddleware)
+}
 
-	// Recovery middleware
-	app.Use(recover.New())
+// securityMiddleware adds security headers
+func securityMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("X-Frame-Options", "DENY")
+		w.Header().Set("X-XSS-Protection", "1; mode=block")
+		w.Header().Set("Referrer-Policy", "strict-origin-when-cross-origin")
+		next.ServeHTTP(w, r)
+	})
+}
 
-	// Logger middleware
-	app.Use(logger.New()) // TODO: Configure logger middleware
+// recoveryMiddleware recovers from panics
+func recoveryMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() {
+			if err := recover(); err != nil {
+				log.L.Error().Interface("panic", err).Msg("Panic recovered")
+				http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+			}
+		}()
+		next.ServeHTTP(w, r)
+	})
+}
 
-	// Compression middleware
-	app.Use(compress.New(compress.Config{
-		Level: compress.LevelBestSpeed,
-	}))
+// responseWriter wraps http.ResponseWriter to capture status code
+type responseWriter struct {
+	http.ResponseWriter
+	statusCode int
+}
 
+func (rw *responseWriter) WriteHeader(code int) {
+	rw.statusCode = code
+	rw.ResponseWriter.WriteHeader(code)
+}
+
+// loggingMiddleware logs requests
+func loggingMiddleware(logger *log.Logger) mux.MiddlewareFunc {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			start := time.Now()
+
+			// Create a response writer wrapper to capture status code
+			rw := &responseWriter{ResponseWriter: w, statusCode: http.StatusOK}
+
+			next.ServeHTTP(rw, r)
+
+			logger.LogRequest(
+				r.Method,
+				r.URL.Path,
+				r.RemoteAddr,
+				r.UserAgent(),
+				rw.statusCode,
+				time.Since(start),
+			)
+		})
+	}
+}
+
+// compressionMiddleware handles compression (simplified)
+func compressionMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// For now, just pass through - you could add gzip compression here
+		next.ServeHTTP(w, r)
+	})
 }
 
 // registerRoutes registers all application routes
-func registerRoutes(app *fiber.App, discoveryHandler *handlers.DiscoveryHandler, oauthHandler *handlers.OAuthHandler, mcpHandler *handlers.MCPHandler) {
+func registerRoutes(router *mux.Router, discoveryHandler *handlers.DiscoveryHandler, oauthHandler *handlers.OAuthHandler, mcpHandler *handlers.MCPHandler) {
 	// Register discovery routes
-	discoveryHandler.RegisterRoutes(app)
+	discoveryHandler.RegisterRoutes(router)
 
 	// Register OAuth2 routes
-	oauthHandler.RegisterRoutes(app)
+	oauthHandler.RegisterRoutes(router)
 
 	// Protected MCP endpoints
-	mcp := app.Group("/mcp")
-	mcp.Use(discoveryHandler.AuthMiddleware()) // Protect MCP endpoints
-	mcpHandler.RegisterRoutes(mcp)
+	mcpRouter := router.PathPrefix("/mcp").Subrouter()
+	mcpRouter.Use(discoveryHandler.AuthMiddleware()) // Protect MCP endpoints
+	mcpHandler.RegisterRoutes(mcpRouter)
 }
 
-func startServer(app *fiber.App, cfg *config.Config, logger *log.Logger) error {
+func startServer(server *http.Server, cfg *config.Config, logger *log.Logger) error {
 	// Create a channel to listen for interrupt signals
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
@@ -168,21 +204,21 @@ func startServer(app *fiber.App, cfg *config.Config, logger *log.Logger) error {
 
 		if cfg.IsTLSEnabled() {
 			logger.Info().
-				Str("address", cfg.GetServerAddress()).
+				Str("address", server.Addr).
 				Str("cert_file", cfg.Server.TLSCertFile).
 				Str("key_file", cfg.Server.TLSKeyFile).
 				Msg("Starting HTTPS server")
 
-			err = app.ListenTLS(cfg.GetServerAddress(), cfg.Server.TLSCertFile, cfg.Server.TLSKeyFile)
+			err = server.ListenAndServeTLS(cfg.Server.TLSCertFile, cfg.Server.TLSKeyFile)
 		} else {
 			logger.Info().
-				Str("address", cfg.GetServerAddress()).
+				Str("address", server.Addr).
 				Msg("Starting HTTP server")
 
-			err = app.Listen(cfg.GetServerAddress())
+			err = server.ListenAndServe()
 		}
 
-		if err != nil {
+		if err != nil && err != http.ErrServerClosed {
 			logger.Fatal().Err(err).Msg("Failed to start server")
 		}
 	}()
@@ -210,12 +246,11 @@ func startServer(app *fiber.App, cfg *config.Config, logger *log.Logger) error {
 	defer cancel()
 
 	// Shutdown server
-	if err := app.ShutdownWithContext(ctx); err != nil {
+	if err := server.Shutdown(ctx); err != nil {
 		logger.Error().Err(err).Msg("Server forced to shutdown")
 		return err
 	}
 
 	logger.Info().Msg("Server shutdown complete")
 	return nil
-
 }

@@ -2,7 +2,9 @@ package handlers
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"net/http"
 	"strings"
 
 	"github.com/ron96g/mcp-utils/pkg/auth"
@@ -10,7 +12,7 @@ import (
 	"github.com/ron96g/mcp-utils/pkg/log"
 	"github.com/ron96g/mcp-utils/pkg/models"
 
-	"github.com/gofiber/fiber/v2"
+	"github.com/gorilla/mux"
 )
 
 // DiscoveryHandler handles OAuth2 discovery endpoints
@@ -40,23 +42,23 @@ func NewDiscoveryHandler(cfg *config.Config) *DiscoveryHandler {
 	}
 }
 
-// RegisterRoutes registers discovery endpoints with the Fiber app
-func (h *DiscoveryHandler) RegisterRoutes(app *fiber.App) {
+// RegisterRoutes registers discovery endpoints with the router
+func (h *DiscoveryHandler) RegisterRoutes(router *mux.Router) {
 	// OAuth 2.0 Authorization Server Metadata (RFC 8414)
-	app.Get("/.well-known/oauth-authorization-server", h.AuthorizationServerMetadata)
+	router.HandleFunc("/.well-known/oauth-authorization-server", h.AuthorizationServerMetadata).Methods("GET")
 
 	// OAuth 2.0 Protected Resource Metadata (RFC 9728)
-	app.Get("/.well-known/oauth-protected-resource", h.ProtectedResourceMetadata)
+	router.HandleFunc("/.well-known/oauth-protected-resource", h.ProtectedResourceMetadata).Methods("GET")
 
 	// OpenID Connect Discovery (if we add OIDC support later)
-	app.Get("/.well-known/openid_configuration", h.OpenIDConfiguration)
+	router.HandleFunc("/.well-known/openid_configuration", h.OpenIDConfiguration).Methods("GET")
 }
 
 // AuthorizationServerMetadata returns OAuth 2.0 Authorization Server Metadata (RFC 8414)
-func (h *DiscoveryHandler) AuthorizationServerMetadata(c *fiber.Ctx) error {
+func (h *DiscoveryHandler) AuthorizationServerMetadata(w http.ResponseWriter, r *http.Request) {
 	h.logger.Debug().
-		Str("user_agent", c.Get("User-Agent")).
-		Str("client_ip", c.IP()).
+		Str("user_agent", r.UserAgent()).
+		Str("client_ip", r.RemoteAddr).
 		Msg("Authorization server metadata requested")
 
 	baseURL := h.config.GetOAuthIssuerURL()
@@ -110,17 +112,17 @@ func (h *DiscoveryHandler) AuthorizationServerMetadata(c *fiber.Ctx) error {
 	}
 
 	// Set response headers
-	c.Set("Content-Type", "application/json")
-	c.Set("Cache-Control", "public, max-age=3600") // Cache for 1 hour
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "public, max-age=3600") // Cache for 1 hour
 
-	return c.JSON(metadata)
+	json.NewEncoder(w).Encode(metadata)
 }
 
 // ProtectedResourceMetadata returns OAuth 2.0 Protected Resource Metadata (RFC 9728)
-func (h *DiscoveryHandler) ProtectedResourceMetadata(c *fiber.Ctx) error {
+func (h *DiscoveryHandler) ProtectedResourceMetadata(w http.ResponseWriter, r *http.Request) {
 	h.logger.Debug().
-		Str("user_agent", c.Get("User-Agent")).
-		Str("client_ip", c.IP()).
+		Str("user_agent", r.UserAgent()).
+		Str("client_ip", r.RemoteAddr).
 		Msg("Protected resource metadata requested")
 
 	baseURL := h.config.GetOAuthIssuerURL()
@@ -138,17 +140,17 @@ func (h *DiscoveryHandler) ProtectedResourceMetadata(c *fiber.Ctx) error {
 	}
 
 	// Set response headers
-	c.Set("Content-Type", "application/json")
-	c.Set("Cache-Control", "public, max-age=3600") // Cache for 1 hour
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "public, max-age=3600") // Cache for 1 hour
 
-	return c.JSON(metadata)
+	json.NewEncoder(w).Encode(metadata)
 }
 
 // OpenIDConfiguration returns OpenID Connect Discovery metadata
-func (h *DiscoveryHandler) OpenIDConfiguration(c *fiber.Ctx) error {
+func (h *DiscoveryHandler) OpenIDConfiguration(w http.ResponseWriter, r *http.Request) {
 	h.logger.Debug().
-		Str("user_agent", c.Get("User-Agent")).
-		Str("client_ip", c.IP()).
+		Str("user_agent", r.UserAgent()).
+		Str("client_ip", r.RemoteAddr).
 		Msg("OpenID Connect configuration requested")
 
 	baseURL := h.config.GetOAuthIssuerURL()
@@ -191,14 +193,14 @@ func (h *DiscoveryHandler) OpenIDConfiguration(c *fiber.Ctx) error {
 	}
 
 	// Set response headers
-	c.Set("Content-Type", "application/json")
-	c.Set("Cache-Control", "public, max-age=3600") // Cache for 1 hour
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "public, max-age=3600") // Cache for 1 hour
 
-	return c.JSON(config)
+	json.NewEncoder(w).Encode(config)
 }
 
 // Handle401Response sends a proper WWW-Authenticate header for 401 responses (RFC 9728)
-func (h *DiscoveryHandler) Handle401Response(c *fiber.Ctx, realm, errorCode, errorDescription string) error {
+func (h *DiscoveryHandler) Handle401Response(w http.ResponseWriter, r *http.Request, realm, errorCode, errorDescription string) {
 	if realm == "" {
 		realm = h.config.GetOAuthIssuerURL()
 	}
@@ -215,8 +217,8 @@ func (h *DiscoveryHandler) Handle401Response(c *fiber.Ctx, realm, errorCode, err
 		authHeader += fmt.Sprintf(", error_description=\"%s\"", errorDescription)
 	}
 
-	c.Set("WWW-Authenticate", authHeader)
-	c.Set("Content-Type", "application/json")
+	w.Header().Set("WWW-Authenticate", authHeader)
+	w.Header().Set("Content-Type", "application/json")
 
 	errorResponse := models.NewOAuth2Error(errorCode, errorDescription)
 
@@ -226,82 +228,91 @@ func (h *DiscoveryHandler) Handle401Response(c *fiber.Ctx, realm, errorCode, err
 		Str("realm", realm).
 		Msg("Sending 401 Unauthorized response")
 
-	return c.Status(fiber.StatusUnauthorized).JSON(errorResponse)
+	w.WriteHeader(http.StatusUnauthorized)
+	json.NewEncoder(w).Encode(errorResponse)
 }
 
-type contextKey string
+type ContextKey string
 
 const (
-	SubjectKey contextKey = "subject"
-	NameKey    contextKey = "name"
-	EmailKey   contextKey = "email"
+	ContextKeyClaims      ContextKey = "claims"
+	ContextKeyAccessToken ContextKey = "access_token"
+	ContextKeyTokenScopes ContextKey = "token_scopes"
+	ContextKeyTokenRoles  ContextKey = "token_roles"
+	ContextKeySubject     ContextKey = "subject"
+	ContextKeyName        ContextKey = "name"
+	ContextKeyEmail       ContextKey = "email"
 )
 
 // AuthMiddleware creates a middleware for protecting endpoints
-func (h *DiscoveryHandler) AuthMiddleware() fiber.Handler {
-	return func(c *fiber.Ctx) error {
-		// Extract Authorization header
-		authHeader := c.Get("Authorization")
-		if authHeader == "" {
-			return h.Handle401Response(c, "", "invalid_request", "Missing Authorization header")
-		}
-
-		// Extract token from header
-		token, err := auth.ExtractTokenFromAuthHeader(authHeader)
-		if err != nil {
-			return h.Handle401Response(c, "", "invalid_request", err.Error())
-		}
-
-		// Validate token
-		result, err := h.tokenValidator.ValidateToken(token)
-		if err != nil {
-			h.logger.Error().
-				Err(err).
-				Str("client_ip", c.IP()).
-				Str("user_agent", c.Get("User-Agent")).
-				Msg("Token validation error")
-			return h.Handle401Response(c, "", "server_error", "Internal server error")
-		}
-
-		if !result.Valid {
-			h.logger.Warn().
-				Str("error", result.Error).
-				Str("client_ip", c.IP()).
-				Str("user_agent", c.Get("User-Agent")).
-				Msg("Token validation failed")
-
-			// Determine appropriate error code based on validation error
-			errorCode := "invalid_token"
-			if result.Error != "" {
-				if strings.Contains(result.Error, "expired") {
-					errorCode = "invalid_token"
-				} else if strings.Contains(result.Error, "scope") {
-					errorCode = "insufficient_scope"
-				}
+func (h *DiscoveryHandler) AuthMiddleware() func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// Extract Authorization header
+			authHeader := r.Header.Get("Authorization")
+			if authHeader == "" {
+				h.Handle401Response(w, r, "", "invalid_request", "Missing Authorization header")
+				return
 			}
 
-			return h.Handle401Response(c, "", errorCode, result.Error)
-		}
-		// Store validated data in context
-		c.Locals("access_token", token)
-		c.Locals("access_token_claims", result.Claims)
-		c.Locals("token_scopes", result.Scopes)
-		c.Locals("token_roles", result.Roles)
+			// Extract token from header
+			token, err := auth.ExtractTokenFromAuthHeader(authHeader)
+			if err != nil {
+				h.Handle401Response(w, r, "", "invalid_request", err.Error())
+				return
+			}
 
-		// Set user context for easy access
-		ctx := context.WithValue(c.Context(), SubjectKey, result.Claims.Subject)
-		ctx = context.WithValue(ctx, NameKey, result.Claims.Name)
-		ctx = context.WithValue(ctx, EmailKey, result.Claims.GetEmailAddress())
-		c.SetUserContext(ctx)
+			// Validate token
+			result, err := h.tokenValidator.ValidateToken(token)
+			if err != nil {
+				h.logger.Error().
+					Err(err).
+					Str("client_ip", r.RemoteAddr).
+					Str("user_agent", r.UserAgent()).
+					Msg("Token validation error")
+				h.Handle401Response(w, r, "", "server_error", "Internal server error")
+				return
+			}
 
-		h.logger.Debug().
-			Str("subject", result.Claims.Subject).
-			Str("name", result.Claims.Name).
-			Str("email", result.Claims.GetEmailAddress()).
-			Strs("scopes", result.Scopes).
-			Strs("roles", result.Roles).
-			Msg("Token validated successfully")
+			if !result.Valid {
+				h.logger.Warn().
+					Str("error", result.Error).
+					Str("client_ip", r.RemoteAddr).
+					Str("user_agent", r.UserAgent()).
+					Msg("Token validation failed")
 
-		return c.Next()
+				// Determine appropriate error code based on validation error
+				errorCode := "invalid_token"
+				if result.Error != "" {
+					if strings.Contains(result.Error, "expired") {
+						errorCode = "invalid_token"
+					} else if strings.Contains(result.Error, "scope") {
+						errorCode = "insufficient_scope"
+					}
+				}
+
+				h.Handle401Response(w, r, "", errorCode, result.Error)
+				return
+			}
+
+			// Set user context for easy access
+			ctx := context.WithValue(r.Context(), ContextKeySubject, result.Claims.Subject)
+			ctx = context.WithValue(ctx, ContextKeyName, result.Claims.Name)
+			ctx = context.WithValue(ctx, ContextKeyEmail, result.Claims.GetEmailAddress())
+			ctx = context.WithValue(ctx, ContextKeyAccessToken, token)
+			ctx = context.WithValue(ctx, ContextKeyClaims, result.Claims)
+			ctx = context.WithValue(ctx, ContextKeyTokenScopes, result.Scopes)
+			ctx = context.WithValue(ctx, ContextKeyTokenRoles, result.Roles)
+
+			h.logger.Debug().
+				Str("subject", result.Claims.Subject).
+				Str("name", result.Claims.Name).
+				Str("email", result.Claims.GetEmailAddress()).
+				Strs("scopes", result.Scopes).
+				Strs("roles", result.Roles).
+				Msg("Token validated successfully")
+
+			next.ServeHTTP(w, r.WithContext(ctx))
+		})
 	}
 }
