@@ -7,12 +7,11 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/go-chi/chi/v5"
 	"github.com/ron96g/mcp-utils/pkg/auth"
 	"github.com/ron96g/mcp-utils/pkg/config"
 	"github.com/ron96g/mcp-utils/pkg/log"
 	"github.com/ron96g/mcp-utils/pkg/models"
-
-	"github.com/gorilla/mux"
 )
 
 // DiscoveryHandler handles OAuth2 discovery endpoints
@@ -27,7 +26,7 @@ func NewDiscoveryHandler(cfg *config.Config) *DiscoveryHandler {
 	validatorConfig := &auth.TokenValidatorConfig{
 		TenantID: cfg.EntraID.TenantID,
 		Audience: cfg.EntraID.Audience,
-		Issuer:   cfg.GetEntraIDAuthority(),
+		Issuer:   cfg.GetEntraIDIssuer(),
 	}
 
 	tokenValidator, err := auth.NewTokenValidator(validatorConfig)
@@ -43,15 +42,15 @@ func NewDiscoveryHandler(cfg *config.Config) *DiscoveryHandler {
 }
 
 // RegisterRoutes registers discovery endpoints with the router
-func (h *DiscoveryHandler) RegisterRoutes(router *mux.Router) {
+func (h *DiscoveryHandler) RegisterRoutes(router chi.Router) {
 	// OAuth 2.0 Authorization Server Metadata (RFC 8414)
-	router.HandleFunc("/.well-known/oauth-authorization-server", h.AuthorizationServerMetadata).Methods("GET")
+	router.Get("/.well-known/oauth-authorization-server", h.AuthorizationServerMetadata)
 
 	// OAuth 2.0 Protected Resource Metadata (RFC 9728)
-	router.HandleFunc("/.well-known/oauth-protected-resource", h.ProtectedResourceMetadata).Methods("GET")
+	router.Get("/.well-known/oauth-protected-resource", h.ProtectedResourceMetadata)
 
 	// OpenID Connect Discovery (if we add OIDC support later)
-	router.HandleFunc("/.well-known/openid_configuration", h.OpenIDConfiguration).Methods("GET")
+	router.Get("/.well-known/openid_configuration", h.OpenIDConfiguration)
 }
 
 // AuthorizationServerMetadata returns OAuth 2.0 Authorization Server Metadata (RFC 8414)

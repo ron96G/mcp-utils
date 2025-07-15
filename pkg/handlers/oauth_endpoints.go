@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/go-chi/chi/v5"
 	"github.com/pkg/errors"
 	"github.com/ron96g/mcp-utils/pkg/auth"
 	"github.com/ron96g/mcp-utils/pkg/config"
@@ -19,7 +20,6 @@ import (
 	"github.com/ron96g/mcp-utils/pkg/models"
 
 	"github.com/go-playground/validator/v10"
-	"github.com/gorilla/mux"
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/microsoft"
 )
@@ -67,21 +67,22 @@ func NewOAuthHandler(cfg *config.Config, clientRegistry auth.ClientRegistry, pkc
 	}
 }
 
-// RegisterRoutes registers OAuth2 endpoints with the mux router
-func (h *OAuthHandler) RegisterRoutes(router *mux.Router) {
-	oauth := router.PathPrefix("/oauth2").Subrouter()
+// RegisterRoutes registers OAuth2 endpoints with the router
+func (h *OAuthHandler) RegisterRoutes(router chi.Router) {
+	router.Route("/oauth2", func(oauth chi.Router) {
+		// Dynamic Client Registration (RFC 7591)
+		oauth.Post("/register", h.RegisterClient)
+		oauth.Get("/register/{client_id}", h.GetClient)
+		oauth.Put("/register/{client_id}", h.UpdateClient)
+		oauth.Delete("/register/{client_id}", h.DeleteClient)
 
-	// Dynamic Client Registration (RFC 7591)
-	oauth.HandleFunc("/register", h.RegisterClient).Methods("POST")
-	oauth.HandleFunc("/register/{client_id}", h.GetClient).Methods("GET")
-	oauth.HandleFunc("/register/{client_id}", h.UpdateClient).Methods("PUT")
-	oauth.HandleFunc("/register/{client_id}", h.DeleteClient).Methods("DELETE")
+		// Authorization Flow
+		oauth.Get("/authorize", h.AuthorizeEndpoint)
+		oauth.Get("/callback", h.CallbackEndpoint)
+		oauth.Post("/token", h.TokenEndpoint)
+		oauth.Post("/revoke", h.RevokeEndpoint)
+	})
 
-	// Authorization Flow
-	oauth.HandleFunc("/authorize", h.AuthorizeEndpoint).Methods("GET")
-	oauth.HandleFunc("/callback", h.CallbackEndpoint).Methods("GET")
-	oauth.HandleFunc("/token", h.TokenEndpoint).Methods("POST")
-	oauth.HandleFunc("/revoke", h.RevokeEndpoint).Methods("POST")
 }
 
 // RegisterClient handles dynamic client registration
@@ -119,9 +120,7 @@ func (h *OAuthHandler) RegisterClient(w http.ResponseWriter, r *http.Request) {
 
 // GetClient retrieves client information
 func (h *OAuthHandler) GetClient(w http.ResponseWriter, r *http.Request) {
-	vars := mux.Vars(r)
-	clientID := vars["client_id"]
-
+	clientID := chi.URLParam(r, "client_id")
 	client, err := h.clientRegistry.GetClient(clientID)
 	if err != nil {
 		h.writeJSONError(w, http.StatusNotFound, models.ErrorInvalidClient, "Client not found")
@@ -153,8 +152,7 @@ func (h *OAuthHandler) GetClient(w http.ResponseWriter, r *http.Request) {
 
 // UpdateClient updates client information
 func (h *OAuthHandler) UpdateClient(w http.ResponseWriter, r *http.Request) {
-	vars := mux.Vars(r)
-	clientID := vars["client_id"]
+	clientID := chi.URLParam(r, "client_id")
 
 	var req models.ClientRegistrationRequest
 	if err := parseJSONBody(r, &req); err != nil {
@@ -177,8 +175,7 @@ func (h *OAuthHandler) UpdateClient(w http.ResponseWriter, r *http.Request) {
 
 // DeleteClient deletes a client
 func (h *OAuthHandler) DeleteClient(w http.ResponseWriter, r *http.Request) {
-	vars := mux.Vars(r)
-	clientID := vars["client_id"]
+	clientID := chi.URLParam(r, "client_id")
 
 	err := h.clientRegistry.DeleteClient(clientID)
 	if err != nil {
@@ -622,13 +619,15 @@ func (h *OAuthHandler) generateAuthorizationCode(session *AuthorizationSession, 
 
 	// Store the code-to-token mapping
 	codeData := &AuthorizationCodeData{
-		Code:        code,
-		ClientID:    session.Client.ClientID,
-		RedirectURI: session.Request.RedirectURI,
-		Scope:       session.Request.Scope,
-		EntraToken:  entraToken,
-		CreatedAt:   time.Now(),
-		ExpiresAt:   time.Now().Add(10 * time.Minute),
+		Code:                code,
+		ClientID:            session.Client.ClientID,
+		CodeChallenge:       session.Request.CodeChallenge,
+		CodeChallengeMethod: session.Request.CodeChallengeMethod,
+		RedirectURI:         session.Request.RedirectURI,
+		Scope:               session.Request.Scope,
+		EntraToken:          entraToken,
+		CreatedAt:           time.Now(),
+		ExpiresAt:           time.Now().Add(10 * time.Minute),
 	}
 
 	if err := h.sessionStore.Set("auth_code_"+code, codeData, 10*time.Minute); err != nil {
@@ -640,14 +639,16 @@ func (h *OAuthHandler) generateAuthorizationCode(session *AuthorizationSession, 
 
 // AuthorizationCodeData represents stored authorization code data
 type AuthorizationCodeData struct {
-	Code        string        `json:"code"`
-	ClientID    string        `json:"client_id"`
-	RedirectURI string        `json:"redirect_uri"`
-	Scope       string        `json:"scope"`
-	EntraToken  *oauth2.Token `json:"entra_token"`
-	CreatedAt   time.Time     `json:"created_at"`
-	ExpiresAt   time.Time     `json:"expires_at"`
-	Used        bool          `json:"used"`
+	Code                string        `json:"code"`
+	CodeChallenge       string        `json:"code_challenge"`
+	CodeChallengeMethod string        `json:"code_challenge_method"`
+	ClientID            string        `json:"client_id"`
+	RedirectURI         string        `json:"redirect_uri"`
+	Scope               string        `json:"scope"`
+	EntraToken          *oauth2.Token `json:"entra_token"`
+	CreatedAt           time.Time     `json:"created_at"`
+	ExpiresAt           time.Time     `json:"expires_at"`
+	Used                bool          `json:"used"`
 }
 
 // handleAuthorizationCodeGrant handles authorization code grant flow
@@ -687,9 +688,21 @@ func (h *OAuthHandler) handleAuthorizationCodeGrant(w http.ResponseWriter, r *ht
 
 	// Verify PKCE if required
 	if req.CodeVerifier != "" {
-		// For simplicity in this implementation, we'll skip PKCE verification here
-		// In a full implementation, you'd retrieve and verify the stored PKCE challenge
-		h.logger.Debug().Msg("PKCE verification skipped in simplified implementation")
+		h.logger.Info().
+			Str("client_id", req.ClientID).
+			Msg("Verifying PKCE CodeChallenge")
+
+		err = h.pkceManager.VerifyAndConsumeChallenge(
+			req.ClientID,
+			req.CodeVerifier,
+			originalCodeData.CodeChallenge,
+			originalCodeData.CodeChallengeMethod,
+		)
+		if err != nil {
+			h.logger.LogSecurityEvent("client_failed_challange", getClientIP(r), getUserAgent(r), "high", nil)
+			h.writeJSONError(w, http.StatusBadRequest, models.ErrorInvalidGrant, "PKCE failed")
+			return
+		}
 	}
 
 	// Atomically mark code as used to prevent race conditions
@@ -762,16 +775,6 @@ func (h *OAuthHandler) getAuthorizationCodeData(code string) (*AuthorizationCode
 	}
 
 	return codeData, nil
-}
-
-// generateRandomString generates a random string for session keys
-func generateRandomString(length int) string {
-	const charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-	result := make([]byte, length)
-	for i := range result {
-		result[i] = charset[time.Now().UnixNano()%int64(len(charset))]
-	}
-	return string(result)
 }
 
 // HTTP utility functions for standard library conversion

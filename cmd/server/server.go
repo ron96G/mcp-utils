@@ -9,13 +9,13 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/go-chi/chi/v5"
+	"github.com/go-chi/chi/v5/middleware"
 	"github.com/ron96g/mcp-utils/pkg/auth"
 	"github.com/ron96g/mcp-utils/pkg/config"
 	"github.com/ron96g/mcp-utils/pkg/handlers"
 	"github.com/ron96g/mcp-utils/pkg/log"
 	"github.com/ron96g/mcp-utils/pkg/storage"
-
-	"github.com/gorilla/mux"
 )
 
 func main() {
@@ -58,7 +58,7 @@ func initializeServer(cfg *config.Config, logger *log.Logger) error {
 	pkceManager := auth.NewMemoryPKCEManager(pkceConfig)
 
 	// Create router
-	router := mux.NewRouter()
+	router := chi.NewRouter()
 
 	// Initialize handlers
 	discoveryHandler := handlers.NewDiscoveryHandler(cfg)
@@ -66,51 +66,34 @@ func initializeServer(cfg *config.Config, logger *log.Logger) error {
 	mcpHandler := handlers.NewMCPHandler()
 
 	// Register middleware
-	registerMiddleware(router, logger)
+	registerMiddleware(router)
 
 	// Register routes
 	registerRoutes(router, discoveryHandler, oauthHandler, mcpHandler)
 
 	// Create HTTP server
 	server := &http.Server{
-		Addr:         cfg.GetServerAddress(),
-		Handler:      router,
-		ReadTimeout:  cfg.Server.ReadTimeout,
-		WriteTimeout: cfg.Server.WriteTimeout,
-		IdleTimeout:  cfg.Server.IdleTimeout,
+		Addr:           cfg.GetServerAddress(),
+		Handler:        router,
+		ReadTimeout:    cfg.Server.ReadTimeout,
+		WriteTimeout:   cfg.Server.WriteTimeout,
+		IdleTimeout:    cfg.Server.IdleTimeout,
+		MaxHeaderBytes: 1 << 20, // 1 MB
 	}
 
 	// Start server
 	return startServer(server, cfg, logger)
 }
 
-// createErrorHandler creates a custom error handler for HTTP
-func createErrorHandler(logger *log.Logger) func(http.ResponseWriter, *http.Request, int, error) {
-	return func(w http.ResponseWriter, r *http.Request, statusCode int, err error) {
-		// Log the error
-		logger.Error().
-			Err(err).
-			Int("status_code", statusCode).
-			Str("method", r.Method).
-			Str("path", r.URL.Path).
-			Str("client_ip", r.RemoteAddr).
-			Str("user_agent", r.UserAgent()).
-			Msg("Request error")
-
-		// Set content type and return error response
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(statusCode)
-		fmt.Fprintf(w, `{"error": true, "message": "%s"}`, err.Error())
-	}
-}
-
 // registerMiddleware registers global middleware
-func registerMiddleware(router *mux.Router, logger *log.Logger) {
+func registerMiddleware(router chi.Router) {
 	// Create middleware chain
 	router.Use(securityMiddleware)
-	router.Use(recoveryMiddleware)
-	router.Use(loggingMiddleware(logger))
-	router.Use(compressionMiddleware)
+	router.Use(middleware.RequestID)
+	router.Use(middleware.RealIP)
+	router.Use(middleware.Logger)
+	router.Use(middleware.Recoverer)
+	router.Use(middleware.Compress(5))
 }
 
 // securityMiddleware adds security headers
@@ -121,67 +104,13 @@ func securityMiddleware(next http.Handler) http.Handler {
 		w.Header().Set("X-XSS-Protection", "1; mode=block")
 		w.Header().Set("Referrer-Policy", "strict-origin-when-cross-origin")
 		w.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:;")
-		next.ServeHTTP(w, r)
-	})
-}
-
-// recoveryMiddleware recovers from panics
-func recoveryMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		defer func() {
-			if err := recover(); err != nil {
-				log.L.Error().Interface("panic", err).Msg("Panic recovered")
-				http.Error(w, "Internal Server Error", http.StatusInternalServerError)
-			}
-		}()
-		next.ServeHTTP(w, r)
-	})
-}
-
-// responseWriter wraps http.ResponseWriter to capture status code
-type responseWriter struct {
-	http.ResponseWriter
-	statusCode int
-}
-
-func (rw *responseWriter) WriteHeader(code int) {
-	rw.statusCode = code
-	rw.ResponseWriter.WriteHeader(code)
-}
-
-// loggingMiddleware logs requests
-func loggingMiddleware(logger *log.Logger) mux.MiddlewareFunc {
-	return func(next http.Handler) http.Handler {
-		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			start := time.Now()
-
-			// Create a response writer wrapper to capture status code
-			rw := &responseWriter{ResponseWriter: w, statusCode: http.StatusOK}
-
-			next.ServeHTTP(rw, r)
-
-			logger.LogRequest(
-				r.Method,
-				r.URL.Path,
-				r.RemoteAddr,
-				r.UserAgent(),
-				rw.statusCode,
-				time.Since(start),
-			)
-		})
-	}
-}
-
-// compressionMiddleware handles compression (simplified)
-func compressionMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// For now, just pass through - you could add gzip compression here
+		w.Header().Set("X-Permitted-Cross-Domain-Policies", "none")
 		next.ServeHTTP(w, r)
 	})
 }
 
 // registerRoutes registers all application routes
-func registerRoutes(router *mux.Router, discoveryHandler *handlers.DiscoveryHandler, oauthHandler *handlers.OAuthHandler, mcpHandler *handlers.MCPHandler) {
+func registerRoutes(router chi.Router, discoveryHandler *handlers.DiscoveryHandler, oauthHandler *handlers.OAuthHandler, mcpHandler *handlers.MCPHandler) {
 	// Register discovery routes
 	discoveryHandler.RegisterRoutes(router)
 
@@ -189,9 +118,11 @@ func registerRoutes(router *mux.Router, discoveryHandler *handlers.DiscoveryHand
 	oauthHandler.RegisterRoutes(router)
 
 	// Protected MCP endpoints
-	mcpRouter := router.PathPrefix("/mcp").Subrouter()
-	mcpRouter.Use(discoveryHandler.AuthMiddleware()) // Protect MCP endpoints
-	mcpHandler.RegisterRoutes(mcpRouter)
+	router.Group(func(mcpRouter chi.Router) {
+		mcpRouter.Use(discoveryHandler.AuthMiddleware()) // Protect MCP endpoints
+		mcpHandler.RegisterRoutes(mcpRouter)
+
+	})
 }
 
 func startServer(server *http.Server, cfg *config.Config, logger *log.Logger) error {

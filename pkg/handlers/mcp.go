@@ -4,7 +4,7 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/gorilla/mux"
+	"github.com/go-chi/chi/v5"
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
 )
@@ -38,6 +38,6 @@ func NewMCPHandler() *MCPHandler {
 	return mcpHandler
 }
 
-func (h *MCPHandler) RegisterRoutes(app *mux.Router) {
-	app.Handle("", server.NewStreamableHTTPServer(h.mcpServer))
+func (h *MCPHandler) RegisterRoutes(app chi.Router) {
+	app.Handle("/mcp", server.NewStreamableHTTPServer(h.mcpServer))
 }

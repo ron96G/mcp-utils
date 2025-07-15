@@ -29,9 +29,8 @@ entra_id:
   client_id: "<some-client-id>"
   client_secret: "<some-client-secret>"
 
-  # Optional: Custom authority (defaults to https://login.microsoftonline.com)
-  authority: "https://login.microsoftonline.com"
-  # audience: "api://270cc554-6fcc-44a8-8409-56dca317ca16"
+  issuer: "https://login.microsoftonline.com"
+  audience: "<some-audience>"
 
   # Default scopes to request from Entra ID
   scopes:

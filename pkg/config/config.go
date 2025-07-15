@@ -42,7 +42,7 @@ type EntraIDConfig struct {
 	TenantID     string   `mapstructure:"tenant_id" validate:"required,uuid4"`
 	ClientID     string   `mapstructure:"client_id" validate:"required,uuid4"`
 	ClientSecret string   `mapstructure:"client_secret" validate:"required,min=20"`
-	Authority    string   `mapstructure:"authority" validate:"required,url"`
+	Issuer       string   `mapstructure:"issuer" validate:"required,url"`
 	Scopes       []string `mapstructure:"scopes" validate:"required,min=1,dive,required"`
 	RedirectURI  string   `mapstructure:"redirect_uri" validate:"required,url"`
 	Audience     string   `mapstructure:"audience"`
@@ -180,19 +180,9 @@ func (c *Config) GetServerAddress() string {
 	return fmt.Sprintf("%s:%d", c.Server.Host, c.Server.Port)
 }
 
-// GetEntraIDAuthority returns the complete Entra ID authority URL
-func (c *Config) GetEntraIDAuthority() string {
-	return fmt.Sprintf("%s/%s/", c.EntraID.Authority, c.EntraID.TenantID)
-}
-
-// GetEntraIDTokenURL returns the Entra ID token endpoint URL
-func (c *Config) GetEntraIDTokenURL() string {
-	return fmt.Sprintf("%s/%s/oauth2/v2.0/token", c.EntraID.Authority, c.EntraID.TenantID)
-}
-
-// GetEntraIDAuthURL returns the Entra ID authorization endpoint URL
-func (c *Config) GetEntraIDAuthURL() string {
-	return fmt.Sprintf("%s/%s/oauth2/v2.0/authorize", c.EntraID.Authority, c.EntraID.TenantID)
+// GetEntraIDIssuer returns the complete Entra ID authority URL
+func (c *Config) GetEntraIDIssuer() string {
+	return c.EntraID.Issuer
 }
 
 // GetOAuthCallbackURL returns the OAuth callback URL for this server
