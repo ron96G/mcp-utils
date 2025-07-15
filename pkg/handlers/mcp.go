@@ -10,10 +10,15 @@ import (
 )
 
 var whoamiHandler server.ToolHandlerFunc = func(ctx context.Context, request mcp.CallToolRequest) (res *mcp.CallToolResult, err error) {
-	name := ctx.Value(ContextKeyName)
-	email := ctx.Value(ContextKeyEmail)
-	res = mcp.NewToolResultText(fmt.Sprintf("Hello, %s! Your email is %s.", name, email))
-
+	name := ctx.Value(ContextKeyName).(string)
+	email := ctx.Value(ContextKeyEmail).(string)
+	readOnly := ctx.Value(ContextKeyReadOnly).(bool)
+	allowedAction := "read"
+	if !readOnly {
+		allowedAction = "write"
+	}
+	msg := fmt.Sprintf("Hello, %s! Your email is %s and you are allowed to %s", name, email, allowedAction)
+	res = mcp.NewToolResultText(msg)
 	return res, nil
 }
 

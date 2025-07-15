@@ -241,6 +241,7 @@ const (
 	ContextKeySubject     ContextKey = "subject"
 	ContextKeyName        ContextKey = "name"
 	ContextKeyEmail       ContextKey = "email"
+	ContextKeyReadOnly    ContextKey = "read_only"
 )
 
 // AuthMiddleware creates a middleware for protecting endpoints
@@ -302,6 +303,7 @@ func (h *DiscoveryHandler) AuthMiddleware() func(http.Handler) http.Handler {
 			ctx = context.WithValue(ctx, ContextKeyClaims, result.Claims)
 			ctx = context.WithValue(ctx, ContextKeyTokenScopes, result.Scopes)
 			ctx = context.WithValue(ctx, ContextKeyTokenRoles, result.Roles)
+			ctx = context.WithValue(ctx, ContextKeyReadOnly, !result.Claims.HasScope("mcp.write"))
 
 			h.logger.Debug().
 				Str("subject", result.Claims.Subject).
